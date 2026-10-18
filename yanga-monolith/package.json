@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Yanga MVP Testing Platform",
   "main": "app.js",
+  "type": "module",
   "scripts": {
     "dev:backend": "nodemon app.js",
     "dev:frontend": "vite",

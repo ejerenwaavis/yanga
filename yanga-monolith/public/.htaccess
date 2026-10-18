@@ -1,0 +1,7 @@
+# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN
+PassengerAppRoot "/home/rokiroqw/yanga/yanga-monolith"
+PassengerBaseURI "/"
+PassengerNodejs "/home/rokiroqw/nodevenv/yanga/yanga-monolith/20/bin/node"
+PassengerAppType node
+PassengerStartupFile app.js
+# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END
