@@ -10,6 +10,19 @@ import sharp from 'sharp';
 const require = createRequire(import.meta.url);
 const archiver = require('archiver');
 
+function createZipArchive(options = { zlib: { level: 9 } }) {
+  if (typeof archiver === 'function') {
+    return archiver('zip', options);
+  }
+  if (archiver && archiver.ZipArchive) {
+    return new archiver.ZipArchive(options);
+  }
+  if (archiver && typeof archiver.default === 'function') {
+    return archiver.default('zip', options);
+  }
+  throw new Error('Unsupported archiver module structure');
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -2271,7 +2284,7 @@ router.get('/api/lab/export', labAuthMiddleware, async (req, res) => {
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
 
-    const archive = archiver('zip', { zlib: { level: 9 } });
+    const archive = createZipArchive({ zlib: { level: 9 } });
     archive.pipe(res);
 
     if (fs.existsSync(ORIGINAL_PHOTO_PATH)) {
