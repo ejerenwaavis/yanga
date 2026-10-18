@@ -23,12 +23,41 @@ if (!fs.existsSync(RESULTS_DIR)) {
   fs.mkdirSync(RESULTS_DIR, { recursive: true });
 }
 
+// Startup Cleanup: Mark any dangling runs left in "running" or "queued" as "interrupted"
+function cleanupDanglingRunsOnStartup() {
+  try {
+    const files = fs.readdirSync(RESULTS_DIR).filter(f => f.endsWith('.json'));
+    let interruptedCount = 0;
+    for (const file of files) {
+      try {
+        const filePath = path.join(RESULTS_DIR, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (data.status === 'running' || data.status === 'queued') {
+          data.status = 'interrupted';
+          data.error = 'Server restarted during execution. Run marked as interrupted.';
+          fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+          interruptedCount++;
+        }
+      } catch {}
+    }
+    if (interruptedCount > 0) {
+      console.log(`[LAB STARTUP] Marked ${interruptedCount} dangling runs as 'interrupted'.`);
+    }
+  } catch (err) {
+    console.warn('[LAB STARTUP] Could not clean dangling runs:', err.message);
+  }
+}
+cleanupDanglingRunsOnStartup();
+
+// Active background jobs registry: runId -> { timeoutId, isCanceled }
+const activeJobs = new Map();
+
 // Multer memory storage for original photo uploads
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
 const router = express.Router();
 
-// Fallback pricing table per run (in USD) when Fal usage metadata is not returned
+// Fallback pricing table per run (in USD)
 const MODEL_PRICING = {
   'fal-ai/flux-pro/kontext': 0.040,
   'fal-ai/flux-pulid': 0.035,
@@ -45,10 +74,10 @@ const MODEL_PRICING = {
  */
 function readLabState() {
   const defaultState = {
-    mode: 'scene_only', // 'scene_only' | 'scene_outfit'
+    mode: 'scene_only',
     scene: 'in a sleek modern high-rise executive corner office, sitting by floor-to-ceiling panoramic glass windows overlooking city skyline, clean modern architectural interior, crisp natural window light, commanding executive confidence',
     outfit: 'wearing an impeccably tailored bespoke Italian business suit with silk pocket square',
-    outputSize: 'match_original', // 'match_original' | '4:5' | '9:16'
+    outputSize: 'match_original',
     seed: 42,
     lastConfig: {
       model: 'fal-ai/flux-pulid',
@@ -93,6 +122,24 @@ function saveLabState(updates) {
 }
 
 /**
+ * Helper to update a specific run's JSON record
+ */
+function updateRunRecord(id, updates) {
+  try {
+    const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
+    if (fs.existsSync(jsonPath)) {
+      const current = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      const updated = { ...current, ...updates };
+      fs.writeFileSync(jsonPath, JSON.stringify(updated, null, 2), 'utf8');
+      return updated;
+    }
+  } catch (err) {
+    console.error(`[LAB] Error updating run record ${id}:`, err);
+  }
+  return null;
+}
+
+/**
  * Upload buffer or file to Fal Storage with fallback to Base64 data URI
  */
 async function uploadToFalStorage(buffer, mimeType = 'image/jpeg') {
@@ -118,7 +165,6 @@ async function applySharpFilmGrain(imageBuffer, sigma = 2.0) {
   try {
     const { data, info } = await sharp(imageBuffer).raw().toBuffer({ resolveWithObject: true });
     
-    // Box-Muller transform for Gaussian noise
     function gaussianNoise(sig) {
       let u = 0, v = 0;
       while (u === 0) u = Math.random();
@@ -187,12 +233,10 @@ export function labAuthMiddleware(req, res, next) {
     return next();
   }
 
-  // If API route, return 401 JSON
   if (req.path.startsWith('/api/') || req.originalUrl.includes('/api/lab')) {
     return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or missing LAB_KEY.' });
   }
 
-  // If HTML page visit without valid key, render prompt
   return res.status(401).send(`
     <!DOCTYPE html>
     <html lang="en">
@@ -226,6 +270,253 @@ export function labAuthMiddleware(req, res, next) {
     </body>
     </html>
   `);
+}
+
+/**
+ * Detached Asynchronous Background Worker for a single run
+ */
+async function processRunJob(runId, jobParams) {
+  const { preset, mode, scene, outfit, outputSize, seed, customConfig, falKey } = jobParams;
+  const numSeed = parseInt(seed, 10) || 42;
+  const startTime = Date.now();
+
+  console.log(`[LAB WORKER START] ${runId} - Preset: ${preset}`);
+  updateRunRecord(runId, { status: 'running' });
+
+  // 180 Second Timeout
+  const timeoutId = setTimeout(() => {
+    const job = activeJobs.get(runId);
+    if (job && !job.isCanceled) {
+      job.isCanceled = true;
+      console.warn(`[LAB TIMEOUT] Run ${runId} timed out after 180 seconds.`);
+      updateRunRecord(runId, {
+        status: 'error',
+        error: 'Job timed out after 180 seconds. The model did not complete within the maximum allowable window.',
+        runtime: '180.0s'
+      });
+      activeJobs.delete(runId);
+    }
+  }, 180000);
+
+  activeJobs.set(runId, { timeoutId, isCanceled: false });
+
+  try {
+    fal.config({ credentials: falKey });
+
+    const photoBuffer = fs.readFileSync(ORIGINAL_PHOTO_PATH);
+    const photoUrl = await uploadToFalStorage(photoBuffer, 'image/jpeg');
+
+    if (activeJobs.get(runId)?.isCanceled) return;
+
+    let editPrompt = '';
+    if (mode === 'scene_outfit' && outfit && outfit.trim()) {
+      editPrompt = `Change the background to ${scene.trim()} and change the outfit to ${outfit.trim()}. Keep the person's face, hair, pose and expression exactly identical. Natural unretouched photo.`;
+    } else {
+      editPrompt = `Change only the background to ${scene.trim()}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo.`;
+    }
+
+    let modelId = '';
+    let modelInput = {};
+    let presetLabel = '';
+    let isPipelineD = false;
+    let estimatedCost = 0.040;
+
+    let kontextDimensions = null;
+    let aspectEnum = 'auto';
+    if (outputSize === '4:5') {
+      kontextDimensions = { width: 1080, height: 1350 };
+      aspectEnum = '4:5';
+    } else if (outputSize === '9:16') {
+      kontextDimensions = { width: 1080, height: 1920 };
+      aspectEnum = '9:16';
+    }
+
+    if (preset === 'A') {
+      presetLabel = 'Preset A (Flux-Pro Kontext)';
+      modelId = 'fal-ai/flux-pro/kontext';
+      modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed };
+      if (kontextDimensions) modelInput.image_size = kontextDimensions;
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'];
+    } else if (preset === 'B') {
+      presetLabel = 'Preset B (PuLID 0.9)';
+      modelId = 'fal-ai/flux-pulid';
+      const pulidPrompt = mode === 'scene_outfit' && outfit
+        ? `${scene}, wearing ${outfit}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`
+        : `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`;
+
+      modelInput = {
+        prompt: pulidPrompt,
+        reference_image_url: photoUrl,
+        id_weight: 0.9,
+        guidance_scale: 2.8,
+        start_step: 1,
+        true_cfg: 1.2,
+        num_inference_steps: 35,
+        seed: numSeed,
+        image_size: kontextDimensions || { width: 1080, height: 1350 },
+        max_sequence_length: '256',
+        enable_safety_checker: true
+      };
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
+    } else if (preset === 'C') {
+      presetLabel = 'Preset C (PuLID 0.8 Natural)';
+      modelId = 'fal-ai/flux-pulid';
+      const pulidPrompt = mode === 'scene_outfit' && outfit
+        ? `${scene}, wearing ${outfit}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`
+        : `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`;
+
+      modelInput = {
+        prompt: pulidPrompt,
+        reference_image_url: photoUrl,
+        id_weight: 0.8,
+        guidance_scale: 2.5,
+        start_step: 2,
+        true_cfg: 1.0,
+        num_inference_steps: 40,
+        seed: numSeed,
+        image_size: kontextDimensions || { width: 1080, height: 1350 },
+        max_sequence_length: '256',
+        enable_safety_checker: true
+      };
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
+    } else if (preset === 'D') {
+      presetLabel = 'Preset D (Kontext + Upscaler 0.2 + Film Grain σ=2)';
+      modelId = 'fal-ai/flux-pro/kontext';
+      modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed };
+      if (kontextDimensions) modelInput.image_size = kontextDimensions;
+      isPipelineD = true;
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
+    } else if (preset === 'E') {
+      presetLabel = 'Preset E (Nano Banana Edit)';
+      modelId = 'fal-ai/nano-banana/edit';
+      modelInput = { prompt: editPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed };
+      if (aspectEnum !== 'auto') modelInput.aspect_ratio = aspectEnum;
+      estimatedCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
+    } else if (preset === 'F') {
+      presetLabel = 'Preset F (Seedream Edit)';
+      modelId = 'fal-ai/bytedance/seedream/v4.5/edit';
+      modelInput = { prompt: editPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed };
+      estimatedCost = MODEL_PRICING['fal-ai/bytedance/seedream/v4.5/edit'];
+    } else if (preset === 'custom' && customConfig) {
+      presetLabel = 'Custom Run';
+      modelId = customConfig.model || 'fal-ai/flux-pulid';
+      modelInput = { ...customConfig.input };
+      if (!modelInput.image_url && !modelInput.reference_image_url && !modelInput.image_urls) {
+        if (modelId.includes('kontext')) {
+          modelInput.image_url = photoUrl;
+        } else if (modelId.includes('banana') || modelId.includes('seedream')) {
+          modelInput.image_urls = [photoUrl];
+          modelInput.image_url = photoUrl;
+        } else {
+          modelInput.reference_image_url = photoUrl;
+        }
+      }
+      if (!modelInput.seed) modelInput.seed = numSeed;
+      estimatedCost = MODEL_PRICING[modelId] || 0.035;
+    }
+
+    if (activeJobs.get(runId)?.isCanceled) return;
+
+    let result = null;
+    try {
+      result = await fal.subscribe(modelId, { input: modelInput });
+    } catch (primaryErr) {
+      if (preset === 'F' && (primaryErr.status === 404 || primaryErr.message?.includes('not found') || primaryErr.body?.detail?.includes('not found'))) {
+        console.warn('[LAB WORKER] Seedream v4.5 not found, falling back to fal-ai/bytedance/seedream/v4/edit');
+        modelId = 'fal-ai/bytedance/seedream/v4/edit';
+        result = await fal.subscribe(modelId, { input: modelInput });
+      } else {
+        throw primaryErr;
+      }
+    }
+
+    if (activeJobs.get(runId)?.isCanceled) return;
+
+    const images = result.data?.images || result.images;
+    let finalImageUrl = images?.[0]?.url || result.data?.image?.url || result.image?.url;
+    if (!finalImageUrl) {
+      throw new Error(`No image URL returned by ${modelId}. Result: ` + JSON.stringify(result));
+    }
+
+    const actualCost = result.data?.usage?.cost ?? result.usage?.cost ?? result.data?.cost ?? estimatedCost;
+
+    // Preset D multi-stage
+    if (isPipelineD) {
+      console.log(`[LAB WORKER D] Stage 2: Passing to fal-ai/clarity-upscaler...`);
+      const upscaleResult = await fal.subscribe('fal-ai/clarity-upscaler', {
+        input: {
+          image_url: finalImageUrl,
+          creativity: 0.2,
+          prompt: 'masterpiece, sharp photography, natural skin texture, visible pores',
+          upscale_factor: 2
+        }
+      });
+      const upscaledImages = upscaleResult.data?.images || upscaleResult.images;
+      const upscaledUrl = upscaledImages?.[0]?.url || upscaleResult.data?.image?.url;
+      if (upscaledUrl) finalImageUrl = upscaledUrl;
+    }
+
+    if (activeJobs.get(runId)?.isCanceled) return;
+
+    const imgResponse = await fetch(finalImageUrl);
+    let finalBuffer = Buffer.from(await imgResponse.arrayBuffer());
+
+    if (isPipelineD) {
+      console.log(`[LAB WORKER D] Stage 3: Applying sharp film grain (sigma ~2)...`);
+      finalBuffer = await applySharpFilmGrain(finalBuffer, 2.0);
+    }
+
+    const localFileName = `${runId}.jpg`;
+    const localFilePath = path.join(RESULTS_DIR, localFileName);
+    fs.writeFileSync(localFilePath, finalBuffer);
+
+    const runtimeMs = Date.now() - startTime;
+    const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
+
+    // Mark as done
+    updateRunRecord(runId, {
+      status: 'done',
+      model: isPipelineD ? 'flux-pro/kontext + clarity-upscaler + film grain' : modelId,
+      params: modelInput,
+      seed: modelInput.seed ?? numSeed,
+      runtime: runtimeStr,
+      cost: typeof actualCost === 'number' ? actualCost : parseFloat(actualCost) || estimatedCost,
+      imageUrl: `/api/lab/results/${localFileName}`,
+      remoteUrl: finalImageUrl
+    });
+
+    saveLabState({
+      mode,
+      scene,
+      outfit,
+      outputSize,
+      seed: numSeed,
+      lastConfig: { model: modelId, input: modelInput }
+    });
+
+    console.log(`[LAB WORKER DONE] ${runId} in ${runtimeStr}`);
+  } catch (error) {
+    const job = activeJobs.get(runId);
+    if (job?.isCanceled) {
+      console.log(`[LAB WORKER] Run ${runId} canceled by user.`);
+      return;
+    }
+
+    const runtimeMs = Date.now() - startTime;
+    const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
+    const errorDetail = error?.body?.detail || error?.message || error?.toString();
+    console.error(`[LAB WORKER ERROR] ${runId} after ${runtimeStr}:`, errorDetail);
+
+    updateRunRecord(runId, {
+      status: 'error',
+      error: errorDetail,
+      runtime: runtimeStr
+    });
+  } finally {
+    const job = activeJobs.get(runId);
+    if (job?.timeoutId) clearTimeout(job.timeoutId);
+    activeJobs.delete(runId);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,12 +593,16 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .btn-run-all:hover:not(:disabled) { opacity: 0.9; }
     .btn-run-all:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    /* Custom JSON card */
+    /* Custom JSON card & Toggle */
+    .toggle-custom-btn { background: transparent; border: 1px dashed #3f3f46; color: var(--text-muted); padding: 8px 14px; border-radius: 8px; font-size: 0.78rem; font-weight: 600; cursor: pointer; width: 100%; text-align: center; transition: all 0.15s; }
+    .toggle-custom-btn:hover { border-color: var(--amber); color: #fff; }
     .code-box { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.78rem; background: #000; color: #a5f3fc; border: 1px solid #222; }
 
     /* Results Gallery */
     .results-gallery { display: flex; flex-direction: column; gap: 1.5rem; }
-    .result-card { background: #141417; border: 1px solid var(--card-border); border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; }
+    .result-card { background: #141417; border: 1px solid var(--card-border); border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; transition: border-color 0.2s; }
+    .result-card.running { border-color: var(--amber); }
+    .result-card.failed { border-color: rgba(239,68,68,0.5); background: #181113; }
     .res-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #222; padding-bottom: 0.75rem; }
     .res-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 0.75rem; }
     .res-badge { padding: 2px 8px; border-radius: 6px; background: rgba(245,158,11,0.15); color: var(--amber); font-weight: 700; font-size: 0.72rem; }
@@ -321,6 +616,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .res-btn.realism:hover { background: rgba(245,158,11,0.3); }
     .res-btn.delete { color: #f87171; border-color: rgba(239,68,68,0.3); }
     .res-btn.delete:hover { background: rgba(239,68,68,0.15); }
+    .res-btn.cancel { background: #7f1d1d; border-color: #ef4444; color: #fecaca; font-weight: 700; }
+    .res-btn.cancel:hover { background: #991b1b; }
 
     /* Side by Side Image Container */
     .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
@@ -328,6 +625,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .comp-col { display: flex; flex-direction: column; gap: 6px; }
     .comp-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
     .comp-img { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #000; border: 1px solid #27272a; }
+    .running-box { width: 100%; min-height: 260px; border-radius: 10px; background: #09090b; border: 2px dashed rgba(245,158,11,0.4); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 1.5rem; text-align: center; }
+    .error-box { width: 100%; min-height: 180px; border-radius: 10px; background: #260a0a; border: 1px solid #dc2626; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 1.25rem; text-align: center; }
 
     /* Stars & Notes */
     .rating-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding-top: 6px; border-top: 1px solid #222; }
@@ -343,6 +642,10 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .progress-bar { background: #27272a; border-radius: 6px; overflow: hidden; height: 8px; width: 100%; margin-top: 6px; display: none; }
     .progress-fill { background: var(--amber); height: 100%; width: 0%; transition: width 0.3s; }
     .alert-err { background: #450a0a; border: 1px solid #ef4444; color: #fca5a5; padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.8rem; display: none; }
+    
+    /* Spinner */
+    .spinner { width: 32px; height: 32px; border: 3px solid rgba(245,158,11,0.2); border-top-color: var(--amber); border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
@@ -353,7 +656,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       <div style="display:flex;align-items:center;gap:10px;">
         <span class="status-dot"></span>
         <span style="font-weight:700;">Yanga Studio Lab</span>
-        <span class="badge">Multi-Model Realism Engine</span>
+        <span class="badge">Background Worker Engine</span>
       </div>
       <div style="display:flex;align-items:center;gap:10px;">
         <div id="topTotalSpend" class="cost-total-badge">Total Spend: $0.000</div>
@@ -556,8 +859,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       </div>
     </div>
 
-    <!-- STEP 4: Custom Run Editor -->
-    <div class="card">
+    <!-- Toggleable Custom JSON Sandbox Button -->
+    <div>
+      <button type="button" id="btnToggleCustom" class="toggle-custom-btn" onclick="toggleCustomSection()">
+        🛠️ Show Custom JSON Sandbox (Single Parameter Tweaks) ▼
+      </button>
+    </div>
+
+    <!-- STEP 4: Custom Run Editor (Hidden by default) -->
+    <div class="card" id="customConfigCard" style="display:none;">
       <div class="card-title">
         <span class="num">4</span>
         <span>Custom Configuration Sandbox (Single Parameter Tweaks)</span>
@@ -608,7 +918,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
   </div>
 
   <script>
-    // Retrieve and persist lab key
     const urlParams = new URLSearchParams(window.location.search);
     const keyFromUrl = urlParams.get('key');
     if (keyFromUrl) {
@@ -617,8 +926,9 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     const LAB_KEY = localStorage.getItem('yanga_lab_key') || '${labKey}';
     let currentResults = [];
     let currentMode = 'scene_only';
+    let pollTimer = null;
+    let isSequenceRunning = false;
 
-    // Helper for authenticated requests
     async function labFetch(url, options = {}) {
       options.headers = options.headers || {};
       options.headers['x-lab-key'] = LAB_KEY;
@@ -639,7 +949,18 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Mode Toggle (Scene only vs Scene + Outfit)
+    function toggleCustomSection() {
+      const card = document.getElementById('customConfigCard');
+      const btn = document.getElementById('btnToggleCustom');
+      if (card.style.display === 'none') {
+        card.style.display = 'flex';
+        btn.textContent = '▲ Hide Custom JSON Sandbox';
+      } else {
+        card.style.display = 'none';
+        btn.textContent = '🛠️ Show Custom JSON Sandbox (Single Parameter Tweaks) ▼';
+      }
+    }
+
     function setMode(mode) {
       currentMode = mode;
       document.getElementById('btnModeSceneOnly').classList.toggle('active', mode === 'scene_only');
@@ -648,7 +969,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       saveCurrentState();
     }
 
-    // Load initial state
     async function loadLabState() {
       try {
         const res = await labFetch('/api/lab/state');
@@ -683,7 +1003,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Save scene & seed state
     async function saveCurrentState() {
       const scene = document.getElementById('sceneInput').value;
       const outfit = document.getElementById('outfitInput').value;
@@ -703,7 +1022,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     document.getElementById('outfitInput').addEventListener('blur', saveCurrentState);
     document.getElementById('seedInput').addEventListener('blur', saveCurrentState);
 
-    // Upload Photo
     async function handlePhotoUpload(file) {
       if (!file) return;
       showError(null);
@@ -712,10 +1030,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       fd.append('photo', file);
 
       try {
-        const res = await labFetch('/api/lab/upload', {
-          method: 'POST',
-          body: fd
-        });
+        const res = await labFetch('/api/lab/upload', { method: 'POST', body: fd });
         const data = await res.json();
         if (data.success) {
           document.getElementById('thumbContainer').style.display = 'block';
@@ -730,7 +1045,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Load Results
     async function loadResults() {
       try {
         const res = await labFetch('/api/lab/results');
@@ -738,9 +1052,31 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         if (data.success && Array.isArray(data.results)) {
           currentResults = data.results;
           renderResults(currentResults);
+          
+          // Check if any jobs are currently active (queued or running)
+          const hasActive = currentResults.some(r => r.status === 'queued' || r.status === 'running');
+          if (hasActive) {
+            startPolling();
+          } else {
+            stopPolling();
+          }
         }
       } catch (err) {
         console.warn('Failed to load results:', err);
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(() => {
+        loadResults();
+      }, 3000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
       }
     }
 
@@ -749,15 +1085,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       const gallery = document.getElementById('resultsGallery');
       const sortVal = document.getElementById('sortSelect').value;
 
-      // Sort results
       const sorted = [...results].sort((a, b) => {
+        if (a.status === 'running' || a.status === 'queued') return -1;
+        if (b.status === 'running' || b.status === 'queued') return 1;
         if (sortVal === 'rating_desc') return (b.rating || 0) - (a.rating || 0);
         if (sortVal === 'rating_asc') return (a.rating || 0) - (b.rating || 0);
         if (sortVal === 'oldest') return new Date(a.timestamp) - new Date(b.timestamp);
-        return new Date(b.timestamp) - new Date(a.timestamp); // newest
+        return new Date(b.timestamp) - new Date(a.timestamp);
       });
 
-      // Calculate running total spend
       const totalCost = results.reduce((sum, r) => sum + (parseFloat(r.cost) || 0), 0);
       const costStr = '$' + totalCost.toFixed(3);
       document.getElementById('topTotalSpend').textContent = 'Total Spend: ' + costStr;
@@ -766,7 +1102,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       countEl.textContent = sorted.length + ' run' + (sorted.length === 1 ? '' : 's');
 
       if (!sorted.length) {
-        gallery.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;">No test runs yet. Run a preset above!</div>';
+        gallery.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;">No test runs yet. Pick a preset above!</div>';
         return;
       }
 
@@ -779,7 +1115,77 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         const costBadge = r.cost != null ? \`<span class="res-cost">💰 $\${parseFloat(r.cost).toFixed(3)}</span>\` : '';
         const parentBadge = r.parentRunId ? \`<span class="res-badge" style="background:rgba(59,130,246,0.15);color:#60a5fa;">🔗 Linked to #\${r.parentRunId}</span>\` : '';
 
-        // Star buttons
+        // Status Card 1: QUEUED OR RUNNING CARD
+        if (r.status === 'queued' || r.status === 'running') {
+          const statusText = r.status === 'queued' ? '⏳ Queued in Worker...' : '⚡ Running on Fal GPU...';
+          return \`
+            <div class="result-card running" id="card-\${r.id}">
+              <div class="res-header">
+                <div class="res-meta">
+                  <span class="res-badge" style="background:#f59e0b;color:#000;font-weight:800;">\${statusText}</span>
+                  <span class="res-badge">\${r.presetLabel || r.preset || 'Run'}</span>
+                  <span class="res-model">\${r.model}</span>
+                  <span>Seed: <strong>\${r.seed ?? 'N/A'}</strong></span>
+                </div>
+                <div class="res-actions">
+                  <button type="button" class="res-btn cancel" onclick="cancelRun('\${r.id}')">🚫 Cancel Job</button>
+                </div>
+              </div>
+              <div class="compare-grid">
+                <div class="comp-col">
+                  <span class="comp-label">Original Reference</span>
+                  <img src="\${origUrl}" class="comp-img" alt="Original Reference" />
+                </div>
+                <div class="comp-col">
+                  <span class="comp-label">Live Status</span>
+                  <div class="running-box">
+                    <div class="spinner"></div>
+                    <div style="font-weight:700;color:#fff;font-size:0.9rem;">\${statusText}</div>
+                    <p style="font-size:0.75rem;color:var(--text-muted);max-width:280px;">Executing in background worker. Page polls automatically every 3s. Refreshing is completely safe.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          \`;
+        }
+
+        // Status Card 2: ERROR, INTERRUPTED, OR CANCELED CARD
+        if (r.status === 'error' || r.status === 'interrupted' || r.status === 'canceled') {
+          const badgeClass = r.status === 'error' ? 'background:#ef4444;color:#fff;' : 'background:#f59e0b;color:#000;';
+          const label = r.status === 'error' ? '❌ Failed' : (r.status === 'interrupted' ? '⚠️ Interrupted' : '🚫 Canceled');
+          return \`
+            <div class="result-card failed" id="card-\${r.id}">
+              <div class="res-header">
+                <div class="res-meta">
+                  <span class="res-badge" style="\${badgeClass}font-weight:800;">\${label}</span>
+                  <span class="res-badge">\${r.presetLabel || r.preset || 'Run'}</span>
+                  <span class="res-model">\${r.model}</span>
+                  <span class="res-runtime">⚡ \${r.runtime || 'N/A'}</span>
+                </div>
+                <div class="res-actions">
+                  <button type="button" class="res-btn delete" onclick="deleteRun('\${r.id}')">🗑 Delete</button>
+                </div>
+              </div>
+              <div class="compare-grid">
+                <div class="comp-col">
+                  <span class="comp-label">Original Reference</span>
+                  <img src="\${origUrl}" class="comp-img" alt="Original Reference" />
+                </div>
+                <div class="comp-col">
+                  <span class="comp-label">Failure Diagnostic</span>
+                  <div class="error-box">
+                    <div style="font-weight:700;color:#fca5a5;font-size:0.85rem;">Run Terminated with Error:</div>
+                    <div style="font-family:monospace;font-size:0.75rem;color:#fecaca;max-height:160px;overflow-y:auto;text-align:left;background:#180606;padding:8px;border-radius:6px;width:100%;box-sizing:border-box;">
+                      \${r.error || 'Unknown error occurred'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          \`;
+        }
+
+        // Status Card 3: COMPLETED SUCCESSFUL RUN (status === 'done')
         let starsHtml = '';
         for (let s = 1; s <= 5; s++) {
           starsHtml += \`<button type="button" class="star-btn \${s <= rating ? 'active' : ''}" onclick="saveRating('\${r.id}', \${s})">★</button>\`;
@@ -804,7 +1210,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
               </div>
             </div>
 
-            <!-- Inline Realism Pass Controls -->
             <div id="realismPanel-\${r.id}" class="realism-panel" style="display:none;">
               <div style="display:flex;justify-content:space-between;align-items:center;">
                 <span style="font-size:0.75rem;font-weight:700;color:var(--amber);">Apply Sharp-Only Realism Pass</span>
@@ -817,7 +1222,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
               </div>
             </div>
 
-            <!-- Side by Side Comparison -->
             <div class="compare-grid">
               <div class="comp-col">
                 <span class="comp-label">Original Reference</span>
@@ -829,7 +1233,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
               </div>
             </div>
 
-            <!-- Star Rating & Notes Row -->
             <div class="rating-row">
               <div style="display:flex;align-items:center;gap:4px;">
                 <span style="font-size:0.72rem;color:var(--text-muted);font-weight:700;margin-right:4px;">RATING:</span>
@@ -838,7 +1241,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
               <input type="text" class="notes-input" placeholder="Add evaluation notes (likeness, skin, pores...)" value="\${notes.replace(/"/g, '&quot;')}" onblur="saveNotes('\${r.id}', this.value)" />
             </div>
 
-            <!-- Parameters Accordion -->
             <details style="font-size:0.75rem;">
               <summary style="cursor:pointer;color:var(--amber);font-weight:600;">Show Full Parameters JSON</summary>
               <pre class="code-box" style="padding:0.75rem;border-radius:8px;margin-top:6px;overflow-x:auto;">\${jsonStr}</pre>
@@ -848,7 +1250,20 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }).join('');
     }
 
-    // Star Rating & Notes Persistence
+    async function cancelRun(id) {
+      try {
+        const res = await labFetch('/api/lab/run/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          loadResults();
+        } else {
+          alert('Cancel failed: ' + (data.error || 'Unknown'));
+        }
+      } catch (err) {
+        alert('Cancel failed: ' + err.message);
+      }
+    }
+
     async function saveRating(id, rating) {
       try {
         const res = await labFetch(\`/api/lab/results/\${encodeURIComponent(id)}/update\`, {
@@ -881,7 +1296,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Toggle Realism Pass Panel
     function toggleRealismPanel(id) {
       const panel = document.getElementById('realismPanel-' + id);
       if (panel) {
@@ -889,7 +1303,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Apply Realism Pass (Sharp finishing)
     async function applyRealismPass(parentId) {
       showError(null);
       const slider = document.getElementById('sigmaSlider-' + parentId);
@@ -927,7 +1340,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Checkbox Preset Selection
     function updateSelectedCount() {
       const all = ['A', 'B', 'C', 'D', 'E', 'F'];
       const selected = all.filter(p => document.getElementById('chkPreset' + p)?.checked);
@@ -942,8 +1354,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       updateSelectedCount();
     }
 
-    // Running Presets
-    async function executeRun(preset, customConfig = null) {
+    async function submitRun(preset, customConfig = null) {
       showError(null);
       const scene = document.getElementById('sceneInput').value;
       const outfit = document.getElementById('outfitInput').value;
@@ -957,32 +1368,27 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       });
       const data = await res.json();
       if (!data.success) {
-        throw new Error(data.error || 'Generation failed.');
+        throw new Error(data.error || 'Submission failed.');
       }
-      return data.result;
+      return data;
     }
 
     function setButtonsDisabled(disabled) {
       document.querySelectorAll('.preset-btn, #btnRunSelected, #btnRunCustom').forEach(b => b.disabled = disabled);
     }
 
+    // Run single preset as background job
     async function runPreset(preset) {
       setButtonsDisabled(true);
       showError(null);
-      const btn = document.getElementById('btnPreset' + preset);
-      const oldHtml = btn.innerHTML;
-      btn.innerHTML = '<div class="p-title" style="color:var(--amber);">⏳ Running Model...</div><div class="p-desc">Processing Fal API subscription...</div>';
 
       try {
-        const result = await executeRun(preset);
+        const data = await submitRun(preset);
         await loadResults();
-        if (result && result.params) {
-          document.getElementById('customJsonInput').value = JSON.stringify({ model: result.model, input: result.params }, null, 2);
-        }
+        startPolling();
       } catch (err) {
         showError('Preset ' + preset + ' Error: ' + err.message);
       } finally {
-        btn.innerHTML = oldHtml;
         setButtonsDisabled(false);
       }
     }
@@ -991,13 +1397,14 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       setButtonsDisabled(true);
       showError(null);
       const btn = document.getElementById('btnRunCustom');
-      btn.textContent = '⏳ Executing...';
+      btn.textContent = '⏳ Queuing...';
 
       try {
         const rawJson = document.getElementById('customJsonInput').value;
         const parsed = JSON.parse(rawJson);
-        await executeRun('custom', parsed);
+        await submitRun('custom', parsed);
         await loadResults();
+        startPolling();
       } catch (err) {
         showError('Custom Run Error: ' + err.message);
       } finally {
@@ -1006,6 +1413,33 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
+    // Helper: Poll single run until finished (max 185s)
+    function pollRunUntilDone(runId, maxWaitMs = 185000) {
+      return new Promise((resolve) => {
+        const startTime = Date.now();
+        const interval = setInterval(async () => {
+          if (!isSequenceRunning || Date.now() - startTime > maxWaitMs) {
+            clearInterval(interval);
+            return resolve({ status: 'timeout' });
+          }
+          try {
+            const res = await labFetch('/api/lab/run/' + encodeURIComponent(runId) + '/status');
+            const data = await res.json();
+            if (data.success && data.result) {
+              const s = data.result.status;
+              if (s === 'done' || s === 'error' || s === 'interrupted' || s === 'canceled') {
+                clearInterval(interval);
+                return resolve(data.result);
+              }
+            }
+          } catch (err) {
+            console.warn('Polling error:', err);
+          }
+        }, 3000);
+      });
+    }
+
+    // Run All / Selected sequentially with timeout & fault tolerance
     async function runSelectedSequential() {
       const allPresets = [
         { id: 'A', name: 'Preset A (Flux-Pro Kontext)' },
@@ -1022,8 +1456,10 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         return;
       }
 
+      isSequenceRunning = true;
       setButtonsDisabled(true);
       showError(null);
+
       const progressText = document.getElementById('runProgressText');
       const progressBar = document.getElementById('progressBar');
       const progressFill = document.getElementById('progressFill');
@@ -1032,27 +1468,36 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       progressBar.style.display = 'block';
 
       for (let i = 0; i < queue.length; i++) {
+        if (!isSequenceRunning) break;
         const item = queue[i];
         const pct = Math.round((i / queue.length) * 100);
         progressFill.style.width = pct + '%';
         progressText.textContent = \`Running [\${i + 1}/\${queue.length}]: \${item.name}...\`;
 
         try {
-          await executeRun(item.id);
+          const runData = await submitRun(item.id);
+          const runId = runData.runId;
+          await loadResults();
+          
+          // Poll until this preset completes or errors (180s timeout enforced by backend)
+          await pollRunUntilDone(runId, 185000);
           await loadResults();
         } catch (err) {
-          showError(\`Failed on \${item.name}: \${err.message}. Continuing queue...\`);
+          // Requirement 4: Continue after any failed preset and show full error card
+          console.warn(\`Preset \${item.name} failed:\`, err.message);
+          await loadResults();
         }
       }
 
       progressFill.style.width = '100%';
-      progressText.textContent = \`✅ All \${queue.length} selected tests completed!\`;
+      progressText.textContent = '✅ All selected tests completed!';
       setTimeout(() => {
         progressText.style.display = 'none';
         progressBar.style.display = 'none';
         progressFill.style.width = '0%';
       }, 5000);
 
+      isSequenceRunning = false;
       setButtonsDisabled(false);
     }
 
@@ -1113,7 +1558,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       document.getElementById('customJsonInput').value = JSON.stringify(cfg, null, 2);
     }
 
-    // Init on page load
     loadLabState();
     loadResults();
   </script>
@@ -1153,7 +1597,6 @@ router.post('/api/lab/state', labAuthMiddleware, (req, res) => {
 
 /**
  * POST /api/lab/upload
- * Upload and save original.jpg
  */
 router.post('/api/lab/upload', labAuthMiddleware, upload.single('photo'), (req, res) => {
   try {
@@ -1171,7 +1614,6 @@ router.post('/api/lab/upload', labAuthMiddleware, upload.single('photo'), (req, 
 
 /**
  * GET /api/lab/original
- * Stream saved original.jpg
  */
 router.get('/api/lab/original', labAuthMiddleware, (req, res) => {
   try {
@@ -1189,7 +1631,7 @@ router.get('/api/lab/original', labAuthMiddleware, (req, res) => {
 
 /**
  * GET /api/lab/results
- * Returns saved runs sorted newest first
+ * Returns all saved runs sorted newest first
  */
 router.get('/api/lab/results', labAuthMiddleware, (req, res) => {
   try {
@@ -1211,23 +1653,64 @@ router.get('/api/lab/results', labAuthMiddleware, (req, res) => {
 });
 
 /**
+ * GET /api/lab/run/:id/status
+ * Polled by frontend every 3 seconds for active runs
+ */
+router.get('/api/lab/run/:id/status', labAuthMiddleware, (req, res) => {
+  try {
+    const jsonPath = path.join(RESULTS_DIR, `${req.params.id}.json`);
+    if (!fs.existsSync(jsonPath)) {
+      return res.status(404).json({ success: false, error: 'Run not found' });
+    }
+    const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    res.json({ success: true, status: data.status, result: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/lab/run/:id/cancel
+ * Cancel an active or queued background job
+ */
+router.post('/api/lab/run/:id/cancel', labAuthMiddleware, (req, res) => {
+  try {
+    const id = req.params.id;
+    const job = activeJobs.get(id);
+    if (job) {
+      job.isCanceled = true;
+      if (job.timeoutId) clearTimeout(job.timeoutId);
+      activeJobs.delete(id);
+    }
+
+    const updated = updateRunRecord(id, {
+      status: 'canceled',
+      error: 'Run canceled by user.'
+    });
+
+    console.log(`[LAB] Run ${id} canceled.`);
+    res.json({ success: true, result: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
  * POST /api/lab/results/:id/update
  * Update rating (1-5) and/or notes
  */
 router.post('/api/lab/results/:id/update', labAuthMiddleware, (req, res) => {
   try {
     const id = req.params.id;
-    const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
-    if (!fs.existsSync(jsonPath)) {
+    const updates = {};
+    if (req.body.rating !== undefined) updates.rating = parseInt(req.body.rating, 10) || 0;
+    if (req.body.notes !== undefined) updates.notes = req.body.notes;
+
+    const updated = updateRunRecord(id, updates);
+    if (!updated) {
       return res.status(404).json({ success: false, error: 'Run record not found' });
     }
-
-    const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-    if (req.body.rating !== undefined) data.rating = parseInt(req.body.rating, 10) || 0;
-    if (req.body.notes !== undefined) data.notes = req.body.notes;
-
-    fs.writeFileSync(jsonPath, JSON.stringify(data, null, 2), 'utf8');
-    res.json({ success: true, result: data });
+    res.json({ success: true, result: updated });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1251,20 +1734,16 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
     console.log(`[LAB REALISM PASS] Applying to ${parentRunId} with sigma ${sigma}...`);
     const parentBuffer = fs.readFileSync(parentFilePath);
 
-    // 1. Subtle contrast lift via sharp linear transformation
     const contrastLifted = await sharp(parentBuffer)
-      .linear(1.05, -2) // 5% slope increase with minimal shadow offset
+      .linear(1.05, -2)
       .toBuffer();
 
-    // 2. Sharp Gaussian film grain with specified sigma
     const grainBuffer = await applySharpFilmGrain(contrastLifted, parseFloat(sigma));
 
-    // 3. Save as new result linked to parent
     const runId = `run_${Date.now()}`;
     const localFileName = `${runId}.jpg`;
     fs.writeFileSync(path.join(RESULTS_DIR, localFileName), grainBuffer);
 
-    // Read parent json if exists
     let parentSeed = 42;
     try {
       const parentJson = JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${parentRunId}.json`), 'utf8'));
@@ -1273,15 +1752,12 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
 
     const newRecord = {
       id: runId,
+      status: 'done',
       preset: 'realism_pass',
       presetLabel: `Realism Pass (σ=${sigma})`,
       parentRunId,
       model: `sharp-finishing (grain σ=${sigma} + contrast lift)`,
-      params: {
-        parentRunId,
-        grain_sigma: sigma,
-        contrast_lift: 1.05
-      },
+      params: { parentRunId, grain_sigma: sigma, contrast_lift: 1.05 },
       seed: parentSeed,
       runtime: '0.3s',
       cost: 0.000,
@@ -1301,7 +1777,6 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
 
 /**
  * GET /api/lab/results/:filename
- * Serve locally saved generated image
  */
 router.get('/api/lab/results/:filename', labAuthMiddleware, (req, res) => {
   try {
@@ -1325,6 +1800,13 @@ router.get('/api/lab/results/:filename', labAuthMiddleware, (req, res) => {
 router.delete('/api/lab/results/:id', labAuthMiddleware, (req, res) => {
   try {
     const id = req.params.id;
+    const job = activeJobs.get(id);
+    if (job) {
+      job.isCanceled = true;
+      if (job.timeoutId) clearTimeout(job.timeoutId);
+      activeJobs.delete(id);
+    }
+
     const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
     const imgJpg = path.join(RESULTS_DIR, `${id}.jpg`);
     const imgPng = path.join(RESULTS_DIR, `${id}.png`);
@@ -1342,15 +1824,10 @@ router.delete('/api/lab/results/:id', labAuthMiddleware, (req, res) => {
 
 /**
  * POST /api/lab/run
- * Execute preset or custom configuration against the persistent original.jpg
+ * Non-blocking: creates run record, returns runId immediately with status "queued",
+ * and processes job asynchronously in detached worker.
  */
-router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
-  const startTime = Date.now();
-  const { preset, mode, scene, outfit, outputSize, seed, customConfig } = req.body;
-  const numSeed = parseInt(seed, 10) || 42;
-
-  console.log(`[LAB RUN START] Preset: ${preset}, Mode: ${mode}, Seed: ${numSeed}`);
-
+router.post('/api/lab/run', labAuthMiddleware, (req, res) => {
   if (!fs.existsSync(ORIGINAL_PHOTO_PATH)) {
     return res.status(400).json({
       success: false,
@@ -1358,7 +1835,6 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     });
   }
 
-  // 1. Verify and configure FAL API key
   const falKey = (process.env.FAL_KEY || '').trim().replace(/^["']|["']$/g, '');
   if (!falKey || falKey === 'your_fal_api_key_here') {
     return res.status(500).json({
@@ -1366,251 +1842,65 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
       error: 'FAL_KEY is not configured in .env. Please check your credentials.'
     });
   }
-  fal.config({ credentials: falKey });
 
-  try {
-    // 2. Upload test photo to Fal Storage (or base64 fallback)
-    const photoBuffer = fs.readFileSync(ORIGINAL_PHOTO_PATH);
-    const photoUrl = await uploadToFalStorage(photoBuffer, 'image/jpeg');
+  const { preset, mode, scene, outfit, outputSize, seed, customConfig } = req.body;
+  const numSeed = parseInt(seed, 10) || 42;
+  const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    // Compose prompt based on "Scene only" vs "Scene + outfit change"
-    let editPrompt = '';
-    if (mode === 'scene_outfit' && outfit && outfit.trim()) {
-      editPrompt = `Change the background to ${scene.trim()} and change the outfit to ${outfit.trim()}. Keep the person's face, hair, pose and expression exactly identical. Natural unretouched photo.`;
-    } else {
-      editPrompt = `Change only the background to ${scene.trim()}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo.`;
-    }
+  let presetLabel = `Preset ${preset}`;
+  if (preset === 'A') presetLabel = 'Preset A (Flux-Pro Kontext)';
+  else if (preset === 'B') presetLabel = 'Preset B (PuLID 0.9)';
+  else if (preset === 'C') presetLabel = 'Preset C (PuLID 0.8 Natural)';
+  else if (preset === 'D') presetLabel = 'Preset D (Kontext + Upscale + Grain)';
+  else if (preset === 'E') presetLabel = 'Preset E (Nano Banana Edit)';
+  else if (preset === 'F') presetLabel = 'Preset F (Seedream Edit)';
+  else if (preset === 'custom') presetLabel = 'Custom Run';
 
-    let modelId = '';
-    let modelInput = {};
-    let presetLabel = '';
-    let isPipelineD = false;
-    let estimatedCost = 0.040;
+  const initialRecord = {
+    id: runId,
+    status: 'queued',
+    preset,
+    presetLabel,
+    model: preset === 'A' || preset === 'D' ? 'fal-ai/flux-pro/kontext'
+      : preset === 'E' ? 'fal-ai/nano-banana/edit'
+      : preset === 'F' ? 'fal-ai/bytedance/seedream/v4.5/edit'
+      : preset === 'custom' ? (customConfig?.model || 'fal-ai/flux-pulid')
+      : 'fal-ai/flux-pulid',
+    params: { preset, mode, scene, outfit, outputSize, seed: numSeed },
+    seed: numSeed,
+    runtime: '0.0s',
+    cost: MODEL_PRICING[preset === 'A' || preset === 'D' ? 'fal-ai/flux-pro/kontext' : 'fal-ai/flux-pulid'] || 0.035,
+    timestamp: new Date().toISOString(),
+    imageUrl: null,
+    remoteUrl: null,
+    hasOriginal: true,
+    rating: 0,
+    notes: ''
+  };
 
-    // Map output size
-    let kontextDimensions = null;
-    let aspectEnum = 'auto';
-    if (outputSize === '4:5') {
-      kontextDimensions = { width: 1080, height: 1350 };
-      aspectEnum = '4:5';
-    } else if (outputSize === '9:16') {
-      kontextDimensions = { width: 1080, height: 1920 };
-      aspectEnum = '9:16';
-    }
+  fs.writeFileSync(path.join(RESULTS_DIR, `${runId}.json`), JSON.stringify(initialRecord, null, 2), 'utf8');
 
-    if (preset === 'A') {
-      presetLabel = 'Preset A (Flux-Pro Kontext)';
-      modelId = 'fal-ai/flux-pro/kontext';
-      modelInput = {
-        prompt: editPrompt,
-        image_url: photoUrl,
-        seed: numSeed
-      };
-      if (kontextDimensions) modelInput.image_size = kontextDimensions;
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'];
-    } else if (preset === 'B') {
-      presetLabel = 'Preset B (PuLID 0.9)';
-      modelId = 'fal-ai/flux-pulid';
-      const pulidPrompt = mode === 'scene_outfit' && outfit
-        ? `${scene}, wearing ${outfit}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`
-        : `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`;
+  // Immediately respond with queued status and runId
+  res.json({
+    success: true,
+    runId,
+    status: 'queued',
+    result: initialRecord
+  });
 
-      modelInput = {
-        prompt: pulidPrompt,
-        reference_image_url: photoUrl,
-        id_weight: 0.9,
-        guidance_scale: 2.8,
-        start_step: 1,
-        true_cfg: 1.2,
-        num_inference_steps: 35,
-        seed: numSeed,
-        image_size: kontextDimensions || { width: 1080, height: 1350 },
-        max_sequence_length: '256',
-        enable_safety_checker: true
-      };
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
-    } else if (preset === 'C') {
-      presetLabel = 'Preset C (PuLID 0.8 Natural)';
-      modelId = 'fal-ai/flux-pulid';
-      const pulidPrompt = mode === 'scene_outfit' && outfit
-        ? `${scene}, wearing ${outfit}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`
-        : `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`;
-
-      modelInput = {
-        prompt: pulidPrompt,
-        reference_image_url: photoUrl,
-        id_weight: 0.8,
-        guidance_scale: 2.5,
-        start_step: 2,
-        true_cfg: 1.0,
-        num_inference_steps: 40,
-        seed: numSeed,
-        image_size: kontextDimensions || { width: 1080, height: 1350 },
-        max_sequence_length: '256',
-        enable_safety_checker: true
-      };
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
-    } else if (preset === 'D') {
-      presetLabel = 'Preset D (Kontext + Upscaler 0.2 + Film Grain σ=2)';
-      modelId = 'fal-ai/flux-pro/kontext';
-      modelInput = {
-        prompt: editPrompt,
-        image_url: photoUrl,
-        seed: numSeed
-      };
-      if (kontextDimensions) modelInput.image_size = kontextDimensions;
-      isPipelineD = true;
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
-    } else if (preset === 'E') {
-      presetLabel = 'Preset E (Nano Banana Edit)';
-      modelId = 'fal-ai/nano-banana/edit';
-      modelInput = {
-        prompt: editPrompt,
-        image_urls: [photoUrl],
-        image_url: photoUrl,
-        num_images: 1,
-        seed: numSeed
-      };
-      if (aspectEnum !== 'auto') modelInput.aspect_ratio = aspectEnum;
-      estimatedCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
-    } else if (preset === 'F') {
-      presetLabel = 'Preset F (Seedream Edit)';
-      modelId = 'fal-ai/bytedance/seedream/v4.5/edit';
-      modelInput = {
-        prompt: editPrompt,
-        image_urls: [photoUrl],
-        image_url: photoUrl,
-        num_images: 1,
-        seed: numSeed
-      };
-      estimatedCost = MODEL_PRICING['fal-ai/bytedance/seedream/v4.5/edit'];
-    } else if (preset === 'custom' && customConfig) {
-      presetLabel = 'Custom Run';
-      modelId = customConfig.model || 'fal-ai/flux-pulid';
-      modelInput = { ...customConfig.input };
-      // Inject photo if not explicitly provided
-      if (!modelInput.image_url && !modelInput.reference_image_url && !modelInput.image_urls) {
-        if (modelId.includes('kontext')) {
-          modelInput.image_url = photoUrl;
-        } else if (modelId.includes('banana') || modelId.includes('seedream')) {
-          modelInput.image_urls = [photoUrl];
-          modelInput.image_url = photoUrl;
-        } else {
-          modelInput.reference_image_url = photoUrl;
-        }
-      }
-      if (!modelInput.seed) modelInput.seed = numSeed;
-      estimatedCost = MODEL_PRICING[modelId] || 0.035;
-    } else {
-      throw new Error(`Unknown preset: ${preset}`);
-    }
-
-    console.log(`[LAB RUN] Subscribing to ${modelId}...`);
-    let result = null;
-    try {
-      result = await fal.subscribe(modelId, { input: modelInput });
-    } catch (primaryErr) {
-      // If Seedream 4.5 is unavailable, gracefully fall back to 4.0
-      if (preset === 'F' && (primaryErr.status === 404 || primaryErr.message?.includes('not found') || primaryErr.body?.detail?.includes('not found'))) {
-        console.warn('[LAB] Seedream v4.5 not found, falling back to fal-ai/bytedance/seedream/v4/edit');
-        modelId = 'fal-ai/bytedance/seedream/v4/edit';
-        result = await fal.subscribe(modelId, { input: modelInput });
-      } else {
-        throw primaryErr;
-      }
-    }
-
-    const images = result.data?.images || result.images;
-    let finalImageUrl = images?.[0]?.url || result.data?.image?.url || result.image?.url;
-
-    if (!finalImageUrl) {
-      throw new Error(`No image URL returned by ${modelId}. Result structure: ` + JSON.stringify(result));
-    }
-
-    // Capture actual cost if returned by Fal API
-    const actualCost = result.data?.usage?.cost ?? result.usage?.cost ?? result.data?.cost ?? estimatedCost;
-
-    // Preset D Multi-stage: Pass through clarity upscaler + apply sharp film grain
-    if (isPipelineD) {
-      console.log(`[LAB RUN D] Stage 2: Passing to fal-ai/clarity-upscaler with creativity 0.2...`);
-      const upscaleResult = await fal.subscribe('fal-ai/clarity-upscaler', {
-        input: {
-          image_url: finalImageUrl,
-          creativity: 0.2,
-          prompt: 'masterpiece, sharp photography, natural skin texture, visible pores',
-          upscale_factor: 2
-        }
-      });
-      const upscaledImages = upscaleResult.data?.images || upscaleResult.images;
-      const upscaledUrl = upscaledImages?.[0]?.url || upscaleResult.data?.image?.url;
-      if (upscaledUrl) {
-        finalImageUrl = upscaledUrl;
-      }
-    }
-
-    // Download generated image locally to results directory
-    const runId = `run_${Date.now()}`;
-    const imgResponse = await fetch(finalImageUrl);
-    let finalBuffer = Buffer.from(await imgResponse.arrayBuffer());
-
-    // If Preset D, apply sharp film grain (sigma ~2)
-    if (isPipelineD) {
-      console.log(`[LAB RUN D] Stage 3: Applying sharp film grain (sigma ~2)...`);
-      finalBuffer = await applySharpFilmGrain(finalBuffer, 2.0);
-    }
-
-    const localFileName = `${runId}.jpg`;
-    const localFilePath = path.join(RESULTS_DIR, localFileName);
-    fs.writeFileSync(localFilePath, finalBuffer);
-
-    const runtimeMs = Date.now() - startTime;
-    const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
-
-    const resultRecord = {
-      id: runId,
-      preset,
-      presetLabel,
-      model: isPipelineD ? 'flux-pro/kontext + clarity-upscaler + film grain' : modelId,
-      params: modelInput,
-      seed: modelInput.seed ?? numSeed,
-      runtime: runtimeStr,
-      cost: typeof actualCost === 'number' ? actualCost : parseFloat(actualCost) || estimatedCost,
-      timestamp: new Date().toISOString(),
-      imageUrl: `/api/lab/results/${localFileName}`,
-      remoteUrl: finalImageUrl,
-      hasOriginal: true,
-      rating: 0,
-      notes: ''
-    };
-
-    // Save JSON record
-    fs.writeFileSync(path.join(RESULTS_DIR, `${runId}.json`), JSON.stringify(resultRecord, null, 2), 'utf8');
-
-    // Update state.json with latest settings
-    saveLabState({
-      mode,
-      scene,
-      outfit,
-      outputSize,
-      seed: numSeed,
-      lastConfig: { model: modelId, input: modelInput }
-    });
-
-    console.log(`[LAB RUN COMPLETE] ${runId} in ${runtimeStr} ($${resultRecord.cost})`);
-    res.json({ success: true, result: resultRecord });
-
-  } catch (error) {
-    const runtimeMs = Date.now() - startTime;
-    const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
-    const errorDetail = error?.body?.detail || error?.message || error?.toString();
-    console.error(`[LAB RUN ERROR] after ${runtimeStr}:`, errorDetail);
-
-    res.status(400).json({
-      success: false,
-      error: errorDetail,
-      runtime: runtimeStr
-    });
-  }
+  // Launch detached background execution
+  processRunJob(runId, {
+    preset,
+    mode,
+    scene,
+    outfit,
+    outputSize,
+    seed: numSeed,
+    customConfig,
+    falKey
+  }).catch(err => {
+    console.error(`[LAB BACKGROUND CRASH] ${runId}:`, err);
+  });
 });
 
 export default router;
