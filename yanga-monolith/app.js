@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 // Route & Middleware Imports
 import generateRoutes from './routes/generate.js';
 import authRoutes from './routes/auth.js';
+import labRouter from './routes/lab.js';
 import { requireRokitSSO } from './middleware/ssoAuth.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +32,9 @@ app.use('/api/auth', authRoutes);
 
 // Protected API Routes (Requires valid Rokit SSO session)
 app.use('/api/generate', requireRokitSSO, generateRoutes);
+
+// Private Testing Lab (Protected by LAB_KEY)
+app.use(labRouter);
 
 // Static File Serving (Monolith Architecture)
 // Serves the Vite output directory
