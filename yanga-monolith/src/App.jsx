@@ -1,14 +1,55 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 export default function App() {
+  const [userId] = useState(() => {
+    let id = localStorage.getItem('yanga_user_id');
+    if (!id) {
+      id = 'usr_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+      localStorage.setItem('yanga_user_id', id);
+    }
+    return id;
+  });
+
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
   const [preset, setPreset] = useState('owambe');
-  const [prompt, setPrompt] = useState('Owambe Glam, Nigerian traditional attire, highly detailed, photorealistic studio lighting, 8k resolution');
+  const [prompt, setPrompt] = useState('Owambe Glam, Nigerian traditional luxury attire, gele / fila, highly detailed, photorealistic studio lighting, elegant, 8k resolution');
   const [customPrompt, setCustomPrompt] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [resultImage, setResultImage] = useState(null);
+
+  // User's private photoshoot gallery (persisted locally & synced with Cloudinary)
+  const [history, setHistory] = useState(() => {
+    try {
+      const saved = localStorage.getItem('yanga_history');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Fetch Cloudinary generation history on mount
+  useEffect(() => {
+    if (!userId) return;
+    fetch(`/api/generate/history?userId=${encodeURIComponent(userId)}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.history) && data.history.length > 0) {
+          setHistory((prev) => {
+            const combinedMap = new Map();
+            data.history.forEach((item) => combinedMap.set(item.imageUrl, item));
+            prev.forEach((item) => combinedMap.set(item.imageUrl, item));
+            const combined = Array.from(combinedMap.values()).sort(
+              (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+            );
+            localStorage.setItem('yanga_history', JSON.stringify(combined));
+            return combined;
+          });
+        }
+      })
+      .catch((err) => console.warn('Could not sync remote history:', err));
+  }, [userId]);
 
   const presets = [
     {
@@ -63,6 +104,7 @@ export default function App() {
     const formData = new FormData();
     formData.append('image', file);
     formData.append('prompt', prompt);
+    formData.append('userId', userId);
 
     try {
       const response = await fetch('/api/generate', {
@@ -73,14 +115,35 @@ export default function App() {
       
       if (data.success && data.imageUrl) {
         setResultImage(data.imageUrl);
+
+        const newEntry = {
+          id: data.publicId || Date.now().toString(),
+          imageUrl: data.imageUrl,
+          referenceUrl: data.referenceUrl,
+          prompt: prompt,
+          createdAt: data.createdAt || new Date().toISOString()
+        };
+
+        setHistory((prev) => {
+          const next = [newEntry, ...prev.filter((x) => x.imageUrl !== newEntry.imageUrl)];
+          localStorage.setItem('yanga_history', JSON.stringify(next));
+          return next;
+        });
       } else {
         setError(data.error || 'Generation failed. Check your FAL_KEY and try again.');
       }
     } catch (err) {
       console.error(err);
-      setError('Network connection failed. Make sure the local server is running.');
+      setError('Network connection failed. Make sure the server is reachable.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const clearHistory = () => {
+    if (confirm('Clear your local photoshoot history?')) {
+      setHistory([]);
+      localStorage.removeItem('yanga_history');
     }
   };
 
@@ -249,6 +312,53 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {/* User's Private Photoshoot History */}
+      {history.length > 0 && (
+        <section className="w-full max-w-4xl mt-12 bg-neutral-900/60 p-6 md:p-8 rounded-2xl border border-neutral-800/80">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                <span>📁 Your Saved Photoshoots</span>
+                <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                  Private to you
+                </span>
+              </h2>
+              <p className="text-xs text-neutral-400 mt-0.5">
+                Saved in your dedicated Cloudinary storage (<code className="text-amber-400/80">yanga-generations</code>).
+              </p>
+            </div>
+            <button
+              onClick={clearHistory}
+              className="text-xs text-neutral-500 hover:text-red-400 transition-colors"
+            >
+              Clear Local View
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+            {history.map((item, idx) => (
+              <div
+                key={item.id || idx}
+                onClick={() => setResultImage(item.imageUrl)}
+                className="group relative bg-neutral-950 rounded-xl overflow-hidden border border-neutral-800 hover:border-amber-500/60 cursor-pointer transition-all shadow-md"
+              >
+                <img
+                  src={item.imageUrl}
+                  alt={item.prompt || 'Generated Photoshoot'}
+                  className="w-full h-40 object-cover group-hover:scale-105 transition-transform duration-300"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity p-2.5 flex flex-col justify-end">
+                  <p className="text-[11px] text-white font-medium line-clamp-2">
+                    {item.prompt || 'AI Photoshoot'}
+                  </p>
+                  <span className="text-[10px] text-amber-400 mt-1">Click to view HD</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
