@@ -1,15 +1,20 @@
 import { useState, useEffect } from 'react';
 
 export default function App() {
-  const [userId] = useState(() => {
-    let id = localStorage.getItem('yanga_user_id');
-    if (!id) {
-      id = 'usr_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-      localStorage.setItem('yanga_user_id', id);
-    }
-    return id;
-  });
+  // Authentication & SSO State
+  const [authChecking, setAuthChecking] = useState(true);
+  const [user, setUser] = useState(null);
 
+  // Login & MFA Gate State
+  const [loginForm, setLoginForm] = useState({ email: '', password: '' });
+  const [showPassword, setShowPassword] = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginError, setLoginError] = useState(null);
+  const [mfaPending, setMfaPending] = useState(false);
+  const [mfaToken, setMfaToken] = useState('');
+  const [otp, setOtp] = useState('');
+
+  // Photoshoot Generation State
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
   const [preset, setPreset] = useState('owambe');
@@ -19,7 +24,7 @@ export default function App() {
   const [error, setError] = useState(null);
   const [resultImage, setResultImage] = useState(null);
 
-  // User's private photoshoot gallery (persisted locally & synced with Cloudinary)
+  // User's private photoshoot gallery
   const [history, setHistory] = useState(() => {
     try {
       const saved = localStorage.getItem('yanga_history');
@@ -29,27 +34,144 @@ export default function App() {
     }
   });
 
-  // Fetch Cloudinary generation history on mount
+  // 1. Check for active Rokit SSO session on mount
   useEffect(() => {
-    if (!userId) return;
-    fetch(`/api/generate/history?userId=${encodeURIComponent(userId)}`)
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.success && Array.isArray(data.history) && data.history.length > 0) {
-          setHistory((prev) => {
-            const combinedMap = new Map();
-            data.history.forEach((item) => combinedMap.set(item.imageUrl, item));
-            prev.forEach((item) => combinedMap.set(item.imageUrl, item));
-            const combined = Array.from(combinedMap.values()).sort(
-              (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-            );
-            localStorage.setItem('yanga_history', JSON.stringify(combined));
-            return combined;
-          });
-        }
-      })
-      .catch((err) => console.warn('Could not sync remote history:', err));
-  }, [userId]);
+    checkSession();
+  }, []);
+
+  const checkSession = async () => {
+    setAuthChecking(true);
+    try {
+      const res = await fetch('/api/auth/me', { credentials: 'include' });
+      const data = await res.json();
+      if (data.success && data.user) {
+        setUser(data.user);
+        loadUserHistory(data.user._id);
+      } else {
+        setUser(null);
+      }
+    } catch (err) {
+      console.warn('SSO check error:', err);
+      setUser(null);
+    } finally {
+      setAuthChecking(false);
+    }
+  };
+
+  // 2. Load private photoshoot history from Cloudinary
+  const loadUserHistory = async (userId) => {
+    try {
+      const res = await fetch(`/api/generate/history?userId=${encodeURIComponent(userId)}`, {
+        credentials: 'include'
+      });
+      const data = await res.json();
+      if (data.success && Array.isArray(data.history)) {
+        setHistory((prev) => {
+          const map = new Map();
+          data.history.forEach((item) => map.set(item.imageUrl, item));
+          prev.forEach((item) => map.set(item.imageUrl, item));
+          const combined = Array.from(map.values()).sort(
+            (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+          );
+          localStorage.setItem('yanga_history', JSON.stringify(combined));
+          return combined;
+        });
+      }
+    } catch (err) {
+      console.warn('Could not load user history:', err);
+    }
+  };
+
+  // 3. Handle Login Submission
+  const handleLoginSubmit = async (e) => {
+    e.preventDefault();
+    setLoginLoading(true);
+    setLoginError(null);
+
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(loginForm),
+        credentials: 'include'
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        setLoginError(data.message || 'Invalid email or password.');
+        return;
+      }
+
+      // If MFA is required by Rokit Online
+      if (data.mfaPending) {
+        setMfaToken(data.mfaToken);
+        setMfaPending(true);
+        return;
+      }
+
+      // Successful direct login
+      if (data.user) {
+        setUser(data.user);
+        loadUserHistory(data.user._id);
+      }
+    } catch (err) {
+      console.error(err);
+      setLoginError('Could not reach authentication service. Please try again.');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  // 4. Handle MFA Verification
+  const handleVerifyMfa = async (e) => {
+    e.preventDefault();
+    if (otp.trim().length !== 6) {
+      setLoginError('Please enter the 6-digit code.');
+      return;
+    }
+    setLoginLoading(true);
+    setLoginError(null);
+
+    try {
+      const res = await fetch('/api/auth/verify-mfa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mfaToken, code: otp.trim() }),
+        credentials: 'include'
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        setLoginError(data.message || 'Incorrect verification code.');
+        return;
+      }
+
+      if (data.user) {
+        setUser(data.user);
+        setMfaPending(false);
+        setOtp('');
+        loadUserHistory(data.user._id);
+      }
+    } catch (err) {
+      console.error(err);
+      setLoginError('Verification failed. Please try again.');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  // 5. Handle Logout
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    } catch (err) {
+      console.warn(err);
+    }
+    setUser(null);
+    setResultImage(null);
+    setPreviewUrl(null);
+    setFile(null);
+  };
 
   const presets = [
     {
@@ -92,6 +214,7 @@ export default function App() {
     setPrompt(p.prompt);
   };
 
+  // 6. Submit Photoshoot Request
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!file) {
@@ -104,15 +227,21 @@ export default function App() {
     const formData = new FormData();
     formData.append('image', file);
     formData.append('prompt', prompt);
-    formData.append('userId', userId);
 
     try {
       const response = await fetch('/api/generate', {
         method: 'POST',
         body: formData,
+        credentials: 'include'
       });
       const data = await response.json();
       
+      if (response.status === 401) {
+        setUser(null);
+        setError('Your session has expired. Please log in again.');
+        return;
+      }
+
       if (data.success && data.imageUrl) {
         setResultImage(data.imageUrl);
 
@@ -130,7 +259,7 @@ export default function App() {
           return next;
         });
       } else {
-        setError(data.error || 'Generation failed. Check your FAL_KEY and try again.');
+        setError(data.error || 'Generation failed. Check balance and try again.');
       }
     } catch (err) {
       console.error(err);
@@ -147,8 +276,201 @@ export default function App() {
     }
   };
 
+  // Loading initial authentication state
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-neutral-950 flex flex-col items-center justify-center text-white">
+        <div className="w-12 h-12 rounded-full border-4 border-amber-500/20 border-t-amber-500 animate-spin mb-4"></div>
+        <p className="text-xs text-neutral-400 font-mono tracking-wider uppercase">Authenticating Rokit SSO...</p>
+      </div>
+    );
+  }
+
+  // ACCESS GATE: Rendered when user is NOT authenticated
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col items-center justify-center p-4">
+        {/* Background glow */}
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_var(--tw-gradient-stops))] from-amber-500/10 via-transparent to-transparent pointer-events-none"></div>
+
+        <div className="w-full max-w-md relative z-10">
+          {/* Brand Eyebrow */}
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-semibold tracking-wide uppercase mb-3">
+              🔒 Member Access Gate
+            </div>
+            <h1 className="text-3xl md:text-4xl font-black text-white tracking-tight">
+              Yanga <span className="text-amber-500">Studio</span>
+            </h1>
+            <p className="text-xs text-neutral-400 mt-2">
+              Protected by Rokit Media SSO (<code className="text-amber-400/80">.rokitonline.com</code>)
+            </p>
+          </div>
+
+          {/* Gate Card */}
+          <div className="bg-neutral-900/90 border border-neutral-800 rounded-2xl p-6 md:p-8 shadow-2xl backdrop-blur-sm">
+            {!mfaPending ? (
+              <form onSubmit={handleLoginSubmit} className="space-y-4">
+                <div className="text-center pb-2">
+                  <h2 className="text-lg font-bold text-white">Sign In to Continue</h2>
+                  <p className="text-xs text-neutral-400 mt-0.5">
+                    Use your central Rokit Media account to access AI photoshoot credits.
+                  </p>
+                </div>
+
+                {loginError && (
+                  <div className="p-3 rounded-xl bg-red-950/50 border border-red-800/60 text-red-300 text-xs flex items-center gap-2">
+                    <span>⚠️</span>
+                    <span>{loginError}</span>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-semibold text-neutral-300 mb-1">Email Address</label>
+                  <input
+                    type="email"
+                    value={loginForm.email}
+                    onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
+                    required
+                    placeholder="your@rokitonline.com"
+                    className="w-full bg-neutral-950 border border-neutral-700 focus:border-amber-500 text-white text-xs px-3.5 py-3 rounded-xl outline-none transition-colors"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-neutral-300 mb-1">Password</label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={loginForm.password}
+                      onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                      required
+                      placeholder="••••••••••••"
+                      className="w-full bg-neutral-950 border border-neutral-700 focus:border-amber-500 text-white text-xs px-3.5 py-3 rounded-xl outline-none transition-colors pr-10"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-neutral-300 text-xs"
+                    >
+                      {showPassword ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loginLoading}
+                  className="w-full bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold py-3 px-4 rounded-xl text-xs transition-all disabled:opacity-50 shadow-lg shadow-amber-500/10 flex items-center justify-center gap-2"
+                >
+                  {loginLoading ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-neutral-950 border-t-transparent rounded-full animate-spin"></div>
+                      <span>Verifying Credentials...</span>
+                    </>
+                  ) : (
+                    <span>Unlock Yanga Studio</span>
+                  )}
+                </button>
+
+                <div className="pt-2 text-center">
+                  <a
+                    href="https://v3.rokitonline.com/login"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[11px] text-neutral-500 hover:text-amber-400 transition-colors"
+                  >
+                    Need an account? Register at rokitonline.com ↗
+                  </a>
+                </div>
+              </form>
+            ) : (
+              <form onSubmit={handleVerifyMfa} className="space-y-4">
+                <div className="text-center pb-2">
+                  <div className="w-12 h-12 rounded-full bg-amber-500/10 text-amber-500 flex items-center justify-center mx-auto mb-2 text-xl font-bold">
+                    🛡️
+                  </div>
+                  <h2 className="text-lg font-bold text-white">Enter Security Code</h2>
+                  <p className="text-xs text-neutral-400 mt-0.5">
+                    A 6-digit verification code was sent to <strong>{loginForm.email}</strong>.
+                  </p>
+                </div>
+
+                {loginError && (
+                  <div className="p-3 rounded-xl bg-red-950/50 border border-red-800/60 text-red-300 text-xs flex items-center gap-2">
+                    <span>⚠️</span>
+                    <span>{loginError}</span>
+                  </div>
+                )}
+
+                <div>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    required
+                    autoFocus
+                    placeholder="123456"
+                    className="w-full bg-neutral-950 border border-neutral-700 focus:border-amber-500 text-center text-white text-2xl font-mono tracking-widest py-3 rounded-xl outline-none"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loginLoading || otp.length !== 6}
+                  className="w-full bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold py-3 px-4 rounded-xl text-xs transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loginLoading ? 'Verifying Code...' : 'Verify & Enter'}
+                </button>
+
+                <div className="flex justify-between items-center pt-2 text-xs text-neutral-400">
+                  <button
+                    type="button"
+                    onClick={() => { setMfaPending(false); setOtp(''); }}
+                    className="hover:text-white transition-colors"
+                  >
+                    ← Back to Login
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleLoginSubmit}
+                    disabled={loginLoading}
+                    className="text-amber-400 hover:underline"
+                  >
+                    Resend Code
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // AUTHENTICATED STUDIO VIEW
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 md:p-10 flex flex-col items-center">
+      {/* Top Bar / User Status Banner */}
+      <div className="w-full max-w-4xl flex items-center justify-between py-2 px-4 mb-6 rounded-xl bg-neutral-900/60 border border-neutral-800 text-xs">
+        <div className="flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+          <span className="text-neutral-400">Member:</span>
+          <span className="text-neutral-200 font-semibold">{user.email || 'Rokit Online User'}</span>
+          <span className="hidden sm:inline-block px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px]">
+            SSO Active
+          </span>
+        </div>
+        <button
+          onClick={handleLogout}
+          className="text-neutral-400 hover:text-red-400 font-medium transition-colors"
+        >
+          Sign Out
+        </button>
+      </div>
+
       {/* Header */}
       <header className="text-center max-w-2xl mb-8">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold tracking-wide uppercase mb-3">
@@ -321,11 +643,11 @@ export default function App() {
               <h2 className="text-lg font-bold text-white flex items-center gap-2">
                 <span>📁 Your Saved Photoshoots</span>
                 <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                  Private to you
+                  Rokit User Vault
                 </span>
               </h2>
               <p className="text-xs text-neutral-400 mt-0.5">
-                Saved in your dedicated Cloudinary storage (<code className="text-amber-400/80">yanga-generations</code>).
+                Saved in your dedicated Cloudinary storage (<code className="text-amber-400/80">yanga-generations/{user._id}</code>).
               </p>
             </div>
             <button

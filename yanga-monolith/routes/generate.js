@@ -18,7 +18,8 @@ const upload = multer({ storage: multer.memoryStorage() });
  */
 router.post('/', upload.single('image'), async (req, res) => {
   try {
-    const { prompt, userId } = req.body;
+    const { prompt } = req.body;
+    const userId = req.user?.userId || req.body?.userId;
     
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No image uploaded' });
@@ -96,7 +97,7 @@ router.post('/', upload.single('image'), async (req, res) => {
  */
 router.get('/history', async (req, res) => {
   try {
-    const { userId } = req.query;
+    const userId = req.user?.userId || req.query.userId;
     if (!userId) {
       return res.json({ success: true, history: [] });
     }
