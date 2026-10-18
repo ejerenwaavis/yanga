@@ -28,12 +28,27 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 
 
 const router = express.Router();
 
+// Fallback pricing table per run (in USD) when Fal usage metadata is not returned
+const MODEL_PRICING = {
+  'fal-ai/flux-pro/kontext': 0.040,
+  'fal-ai/flux-pulid': 0.035,
+  'fal-ai/clarity-upscaler': 0.020,
+  'fal-ai/nano-banana/edit': 0.015,
+  'fal-ai/nano-banana-pro': 0.025,
+  'fal-ai/bytedance/seedream/v4.5/edit': 0.025,
+  'fal-ai/bytedance/seedream/v4/edit': 0.020,
+  'realism_pass': 0.000
+};
+
 /**
  * Read or initialize state.json
  */
 function readLabState() {
   const defaultState = {
-    scene: 'in a sleek modern high-rise executive corner office, sitting by floor-to-ceiling panoramic glass windows overlooking city skyline, wearing an impeccably tailored bespoke business suit, clean modern architectural interior, crisp natural window light, commanding executive confidence',
+    mode: 'scene_only', // 'scene_only' | 'scene_outfit'
+    scene: 'in a sleek modern high-rise executive corner office, sitting by floor-to-ceiling panoramic glass windows overlooking city skyline, clean modern architectural interior, crisp natural window light, commanding executive confidence',
+    outfit: 'wearing an impeccably tailored bespoke Italian business suit with silk pocket square',
+    outputSize: 'match_original', // 'match_original' | '4:5' | '9:16'
     seed: 42,
     lastConfig: {
       model: 'fal-ai/flux-pulid',
@@ -97,7 +112,7 @@ async function uploadToFalStorage(buffer, mimeType = 'image/jpeg') {
 }
 
 /**
- * Apply Gaussian film grain (sigma ~2) via sharp
+ * Apply Gaussian film grain (sigma 1.5-2.5) via sharp
  */
 async function applySharpFilmGrain(imageBuffer, sigma = 2.0) {
   try {
@@ -238,12 +253,13 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); color: var(--text); font-family: var(--font); line-height: 1.5; padding: 1rem; min-height: 100vh; }
-    .container { max-width: 1024px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.5rem; }
+    .container { max-width: 1060px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.5rem; }
     
     /* Top Bar */
-    .topbar { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem; background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; font-size: 0.8rem; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem; background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; font-size: 0.8rem; flex-wrap: wrap; gap: 8px; }
     .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.25); color: var(--amber); font-weight: 600; font-size: 0.75rem; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; }
+    .cost-total-badge { background: rgba(16,185,129,0.15); border: 1px solid rgba(16,185,129,0.3); color: #34d399; padding: 4px 10px; border-radius: 8px; font-weight: 700; font-size: 0.75rem; }
 
     /* Cards */
     .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; }
@@ -254,25 +270,34 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .upload-container { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
     .thumb-wrap { width: 140px; height: 180px; border-radius: 10px; overflow: hidden; border: 2px solid var(--amber); position: relative; background: #000; }
     .thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
-    .upload-btn-label { display: inline-block; background: #27272a; hover: #3f3f46; color: #fff; padding: 8px 16px; border-radius: 8px; font-size: 0.8rem; font-weight: 600; cursor: pointer; border: 1px solid #3f3f46; transition: background 0.15s; }
+    .upload-btn-label { display: inline-block; background: #27272a; color: #fff; padding: 8px 16px; border-radius: 8px; font-size: 0.8rem; font-weight: 600; cursor: pointer; border: 1px solid #3f3f46; transition: background 0.15s; }
     .upload-btn-label:hover { background: #3f3f46; }
 
     /* Inputs */
     label { font-size: 0.8rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 4px; }
-    textarea, input[type="text"], input[type="number"] { width: 100%; background: #09090b; border: 1px solid var(--card-border); border-radius: 8px; color: #fff; padding: 0.75rem; font-size: 0.85rem; font-family: inherit; outline: none; }
-    textarea:focus, input:focus { border-color: var(--amber); }
+    textarea, input[type="text"], input[type="number"], select { width: 100%; background: #09090b; border: 1px solid var(--card-border); border-radius: 8px; color: #fff; padding: 0.75rem; font-size: 0.85rem; font-family: inherit; outline: none; }
+    textarea:focus, input:focus, select:focus { border-color: var(--amber); }
     textarea { min-height: 80px; resize: vertical; }
 
+    /* Segmented Mode Toggle */
+    .toggle-group { display: inline-flex; background: #09090b; border: 1px solid var(--card-border); border-radius: 8px; padding: 3px; gap: 3px; }
+    .toggle-btn { background: transparent; border: none; color: var(--text-muted); padding: 6px 14px; font-size: 0.78rem; font-weight: 700; border-radius: 6px; cursor: pointer; transition: all 0.15s; }
+    .toggle-btn.active { background: var(--amber); color: #09090b; }
+
     /* Preset Grid */
-    .presets-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0.75rem; }
-    .preset-btn { background: #1c1c21; border: 1px solid #2e2e36; border-radius: 10px; padding: 1rem; text-align: left; cursor: pointer; transition: all 0.15s; display: flex; flex-direction: column; justify-content: space-between; min-height: 120px; }
-    .preset-btn:hover:not(:disabled) { border-color: var(--amber); background: #24242b; transform: translateY(-1px); }
+    .presets-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }
+    .preset-card { background: #1c1c21; border: 1px solid #2e2e36; border-radius: 10px; padding: 0.9rem; transition: all 0.15s; display: flex; flex-direction: column; justify-content: space-between; position: relative; }
+    .preset-card:hover { border-color: var(--amber); }
+    .preset-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .preset-checkbox { width: 16px; height: 16px; accent-color: var(--amber); cursor: pointer; }
+    .preset-btn { background: transparent; border: none; text-align: left; cursor: pointer; padding: 0; width: 100%; color: inherit; }
     .preset-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    .p-tag { font-size: 0.7rem; font-weight: 800; color: var(--amber); text-transform: uppercase; margin-bottom: 4px; }
-    .p-title { font-size: 0.85rem; font-weight: 700; color: #fff; line-height: 1.3; margin-bottom: 6px; }
+    .p-tag { font-size: 0.7rem; font-weight: 800; color: var(--amber); text-transform: uppercase; }
+    .p-cost { font-size: 0.7rem; color: #34d399; font-weight: 600; }
+    .p-title { font-size: 0.85rem; font-weight: 700; color: #fff; line-height: 1.3; margin: 4px 0; }
     .p-desc { font-size: 0.72rem; color: var(--text-muted); line-height: 1.4; }
 
-    /* Run All Button */
+    /* Run Selected Button */
     .btn-run-all { background: linear-gradient(135deg, #f59e0b, #d97706); color: #000; font-weight: 800; font-size: 0.9rem; padding: 0.85rem 1.25rem; border: none; border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: opacity 0.15s; box-shadow: 0 4px 14px rgba(245,158,11,0.25); }
     .btn-run-all:hover:not(:disabled) { opacity: 0.9; }
     .btn-run-all:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -286,10 +311,14 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .res-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #222; padding-bottom: 0.75rem; }
     .res-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 0.75rem; }
     .res-badge { padding: 2px 8px; border-radius: 6px; background: rgba(245,158,11,0.15); color: var(--amber); font-weight: 700; font-size: 0.72rem; }
-    .res-model { padding: 2px 8px; border-radius: 6px; background: #27272a; color: #d4d4d8; font-mono; font-size: 0.7rem; }
+    .res-model { padding: 2px 8px; border-radius: 6px; background: #27272a; color: #d4d4d8; font-family: monospace; font-size: 0.7rem; }
     .res-runtime { color: #10b981; font-weight: 600; }
-    .res-actions { display: flex; gap: 8px; }
-    .res-btn { background: #27272a; border: 1px solid #3f3f46; color: #fff; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; cursor: pointer; text-decoration: none; }
+    .res-cost { color: #34d399; font-weight: 700; }
+    .res-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .res-btn { background: #27272a; border: 1px solid #3f3f46; color: #fff; padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; }
+    .res-btn:hover { background: #3f3f46; }
+    .res-btn.realism { background: rgba(245,158,11,0.15); border-color: rgba(245,158,11,0.4); color: var(--amber); font-weight: 700; }
+    .res-btn.realism:hover { background: rgba(245,158,11,0.3); }
     .res-btn.delete { color: #f87171; border-color: rgba(239,68,68,0.3); }
     .res-btn.delete:hover { background: rgba(239,68,68,0.15); }
 
@@ -298,7 +327,17 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     @media (max-width: 640px) { .compare-grid { grid-template-columns: 1fr; } }
     .comp-col { display: flex; flex-direction: column; gap: 6px; }
     .comp-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
-    .comp-img { width: 100%; max-height: 440px; object-fit: contain; border-radius: 10px; background: #000; border: 1px solid #27272a; }
+    .comp-img { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #000; border: 1px solid #27272a; }
+
+    /* Stars & Notes */
+    .rating-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding-top: 6px; border-top: 1px solid #222; }
+    .star-btn { background: transparent; border: none; font-size: 1.15rem; color: #3f3f46; cursor: pointer; padding: 0 2px; transition: color 0.15s; }
+    .star-btn.active, .star-btn:hover { color: var(--amber); }
+    .notes-input { flex: 1; min-width: 200px; background: #09090b; border: 1px solid #27272a; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 0.78rem; outline: none; }
+    .notes-input:focus { border-color: var(--amber); }
+
+    /* Realism Pass Modal / Inline Panel */
+    .realism-panel { background: #09090b; border: 1px solid rgba(245,158,11,0.3); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
 
     /* Progress Overlay */
     .progress-bar { background: #27272a; border-radius: 6px; overflow: hidden; height: 8px; width: 100%; margin-top: 6px; display: none; }
@@ -314,9 +353,10 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       <div style="display:flex;align-items:center;gap:10px;">
         <span class="status-dot"></span>
         <span style="font-weight:700;">Yanga Studio Lab</span>
-        <span class="badge">Experimental Baseline Engine</span>
+        <span class="badge">Multi-Model Realism Engine</span>
       </div>
-      <div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div id="topTotalSpend" class="cost-total-badge">Total Spend: $0.000</div>
         <span style="color:var(--text-muted);font-size:0.75rem;">Key Active ✓</span>
       </div>
     </div>
@@ -344,79 +384,171 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       </div>
     </div>
 
-    <!-- STEP 2: Scene & Seed -->
+    <!-- STEP 2: Scene, Outfit Toggle, Output Size & Seed -->
     <div class="card">
-      <div class="card-title">
-        <span class="num">2</span>
-        <span>Scene Prompt & Seed Calibration</span>
+      <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="num">2</span>
+          <span>Prompt & Framing Calibration</span>
+        </div>
+        
+        <!-- Scene Only vs Scene + Outfit Change Toggle -->
+        <div class="toggle-group">
+          <button type="button" class="toggle-btn active" id="btnModeSceneOnly" onclick="setMode('scene_only')">Scene Only</button>
+          <button type="button" class="toggle-btn" id="btnModeSceneOutfit" onclick="setMode('scene_outfit')">Scene + Outfit Change</button>
+        </div>
       </div>
+
+      <!-- Scene Description -->
       <div>
-        <label>Scene Description (appended or used in background transformation)</label>
+        <label>Scene Description (Destination environment, lighting & interior)</label>
         <textarea id="sceneInput" placeholder="Describe the scene environment, lighting, and interior..."></textarea>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 140px;gap:12px;align-items:end;">
+
+      <!-- Outfit Description (Conditional) -->
+      <div id="outfitContainer" style="display:none;">
+        <label>Outfit Instruction (Replaces original clothes while keeping face & pose identical)</label>
+        <input type="text" id="outfitInput" placeholder="e.g. wearing an impeccably tailored navy bespoke Italian suit with silk pocket square">
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 120px;gap:12px;align-items:end;">
+        <!-- Output Size for Kontext Presets -->
         <div>
-          <label>Seed (Locks latent noise for identical seed comparisons)</label>
+          <label>Kontext Output Size</label>
+          <select id="kontextSizeSelect" onchange="saveCurrentState()">
+            <option value="match_original">Match Original Aspect Ratio (Default)</option>
+            <option value="4:5">4:5 (IG Portrait Feed - 1080x1350)</option>
+            <option value="9:16">9:16 (Story / Reel - 1080x1920)</option>
+          </select>
+        </div>
+
+        <!-- Seed Input -->
+        <div>
+          <label>Seed (Locks latent noise)</label>
           <input type="number" id="seedInput" value="42">
         </div>
+
+        <!-- Randomize Seed Button -->
         <button type="button" class="upload-btn-label" style="text-align:center;padding:10px;" onclick="document.getElementById('seedInput').value = Math.floor(Math.random() * 9999999); saveCurrentState();">
-          🎲 Randomize
+          🎲 Seed
         </button>
       </div>
     </div>
 
-    <!-- STEP 3: Presets & Run All -->
+    <!-- STEP 3: Presets & Run Selected -->
     <div class="card">
-      <div class="card-title">
-        <span class="num">3</span>
-        <span>A/B/C/D Baseline Presets</span>
+      <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="num">3</span>
+          <span>Image-Edit & In-Context Models (A through F)</span>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button type="button" class="res-btn" onclick="toggleAllPresets(true)">Select All</button>
+          <button type="button" class="res-btn" onclick="toggleAllPresets(false)">Deselect All</button>
+        </div>
       </div>
       
       <div class="presets-grid">
         <!-- Preset A -->
-        <button type="button" class="preset-btn" id="btnPresetA" onclick="runPreset('A')">
-          <div>
-            <div class="p-tag">Preset A</div>
-            <div class="p-title">FLUX.1 Kontext [pro]</div>
-            <div class="p-desc">In-context background replacement. Locks exact face, hair, outfit, pose and expression.</div>
+        <div class="preset-card">
+          <div class="preset-header">
+            <span class="p-tag">Preset A</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.040</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetA" checked onchange="updateSelectedCount()">
+            </div>
           </div>
-          <div style="font-size:0.72rem;color:var(--amber);margin-top:8px;">fal-ai/flux-pro/kontext ↗</div>
-        </button>
+          <button type="button" class="preset-btn" id="btnPresetA" onclick="runPreset('A')">
+            <div class="p-title">FLUX.1 Kontext [pro]</div>
+            <div class="p-desc">In-context background & outfit swap. Locks exact face, hair, and pose.</div>
+            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/flux-pro/kontext ↗</div>
+          </button>
+        </div>
 
         <!-- Preset B -->
-        <button type="button" class="preset-btn" id="btnPresetB" onclick="runPreset('B')">
-          <div>
-            <div class="p-tag">Preset B</div>
+        <div class="preset-card">
+          <div class="preset-header">
+            <span class="p-tag">Preset B</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.035</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetB" checked onchange="updateSelectedCount()">
+            </div>
+          </div>
+          <button type="button" class="preset-btn" id="btnPresetB" onclick="runPreset('B')">
             <div class="p-title">PuLID Baseline 0.9</div>
             <div class="p-desc">id_weight 0.9, CFG 1.2, guidance 2.8, start_step 1, 35 steps.</div>
-          </div>
-          <div style="font-size:0.72rem;color:var(--amber);margin-top:8px;">fal-ai/flux-pulid ↗</div>
-        </button>
+            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/flux-pulid ↗</div>
+          </button>
+        </div>
 
         <!-- Preset C -->
-        <button type="button" class="preset-btn" id="btnPresetC" onclick="runPreset('C')">
-          <div>
-            <div class="p-tag">Preset C</div>
+        <div class="preset-card">
+          <div class="preset-header">
+            <span class="p-tag">Preset C</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.035</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetC" checked onchange="updateSelectedCount()">
+            </div>
+          </div>
+          <button type="button" class="preset-btn" id="btnPresetC" onclick="runPreset('C')">
             <div class="p-title">PuLID Natural 0.8</div>
             <div class="p-desc">id_weight 0.8, CFG 1.0 (pure flow), guidance 2.5, start_step 2, 40 steps.</div>
-          </div>
-          <div style="font-size:0.72rem;color:var(--amber);margin-top:8px;">fal-ai/flux-pulid ↗</div>
-        </button>
+            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/flux-pulid ↗</div>
+          </button>
+        </div>
 
         <!-- Preset D -->
-        <button type="button" class="preset-btn" id="btnPresetD" onclick="runPreset('D')">
-          <div>
-            <div class="p-tag">Preset D</div>
+        <div class="preset-card">
+          <div class="preset-header">
+            <span class="p-tag">Preset D</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.060</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetD" checked onchange="updateSelectedCount()">
+            </div>
+          </div>
+          <button type="button" class="preset-btn" id="btnPresetD" onclick="runPreset('D')">
             <div class="p-title">Kontext + Upscale + Grain</div>
             <div class="p-desc">Preset A output &rarr; Clarity Upscaler (creativity 0.2) &rarr; Film Grain (&sigma;&approx;2).</div>
+            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">Multi-Stage Pipeline ↗</div>
+          </button>
+        </div>
+
+        <!-- Preset E: Nano Banana Edit -->
+        <div class="preset-card">
+          <div class="preset-header">
+            <span class="p-tag">Preset E</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.015</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetE" checked onchange="updateSelectedCount()">
+            </div>
           </div>
-          <div style="font-size:0.72rem;color:var(--amber);margin-top:8px;">Multi-Stage Pipeline ↗</div>
-        </button>
+          <button type="button" class="preset-btn" id="btnPresetE" onclick="runPreset('E')">
+            <div class="p-title">Nano Banana Edit</div>
+            <div class="p-desc">Gemini multimodal image editor. Edits background while preserving human subject.</div>
+            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/nano-banana/edit ↗</div>
+          </button>
+        </div>
+
+        <!-- Preset F: Seedream Edit -->
+        <div class="preset-card">
+          <div class="preset-header">
+            <span class="p-tag">Preset F</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.025</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetF" checked onchange="updateSelectedCount()">
+            </div>
+          </div>
+          <button type="button" class="preset-btn" id="btnPresetF" onclick="runPreset('F')">
+            <div class="p-title">Seedream Edit</div>
+            <div class="p-desc">ByteDance Seedream image-to-image editor with high compositional accuracy.</div>
+            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">bytedance/seedream edit ↗</div>
+          </button>
+        </div>
       </div>
 
-      <!-- Run All Button & Progress Bar -->
-      <button type="button" class="btn-run-all" id="btnRunAll" onclick="runAllSequential()">
-        <span>⚡ Run All Baseline Tests (Sequential A &rarr; B &rarr; C &rarr; D)</span>
+      <!-- Run Selected Button & Progress Bar -->
+      <button type="button" class="btn-run-all" id="btnRunSelected" onclick="runSelectedSequential()">
+        <span id="runSelectedLabel">⚡ Run Selected Presets (6 of 6 Selected)</span>
       </button>
       <div id="runProgressText" style="font-size:0.78rem;color:var(--amber);font-weight:600;display:none;"></div>
       <div id="progressBar" class="progress-bar">
@@ -435,10 +567,12 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         <textarea id="customJsonInput" class="code-box" style="min-height:160px;"></textarea>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-        <div style="display:flex;gap:6px;">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
           <button type="button" class="res-btn" onclick="populateCustomPreset('A')">Load A</button>
           <button type="button" class="res-btn" onclick="populateCustomPreset('B')">Load B</button>
           <button type="button" class="res-btn" onclick="populateCustomPreset('C')">Load C</button>
+          <button type="button" class="res-btn" onclick="populateCustomPreset('E')">Load E</button>
+          <button type="button" class="res-btn" onclick="populateCustomPreset('F')">Load F</button>
         </div>
         <button type="button" class="upload-btn-label" id="btnRunCustom" style="background:var(--amber);color:#000;border:none;font-weight:700;" onclick="runCustom()">
           ▶ Run Custom Config
@@ -448,12 +582,21 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     <!-- STEP 5: Results Gallery -->
     <div class="card">
-      <div class="card-title" style="justify-content:space-between;">
+      <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
         <div style="display:flex;align-items:center;gap:8px;">
           <span class="num">5</span>
           <span>Results & Side-by-Side Comparison Gallery</span>
         </div>
-        <span id="resultsCount" style="font-size:0.75rem;color:var(--text-muted);font-weight:normal;">0 runs</span>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <span id="gallerySpendTotal" style="font-size:0.75rem;color:#34d399;font-weight:700;">$0.000 spent</span>
+          <select id="sortSelect" onchange="renderResults(currentResults)" style="padding:4px 8px;font-size:0.75rem;width:auto;">
+            <option value="newest">Sort: Newest First</option>
+            <option value="rating_desc">Sort: Highest Rated (★)</option>
+            <option value="rating_asc">Sort: Lowest Rated</option>
+            <option value="oldest">Sort: Oldest First</option>
+          </select>
+          <span id="resultsCount" style="font-size:0.75rem;color:var(--text-muted);font-weight:normal;">0 runs</span>
+        </div>
       </div>
       <div id="resultsGallery" class="results-gallery">
         <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;">
@@ -472,6 +615,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       localStorage.setItem('yanga_lab_key', keyFromUrl);
     }
     const LAB_KEY = localStorage.getItem('yanga_lab_key') || '${labKey}';
+    let currentResults = [];
+    let currentMode = 'scene_only';
 
     // Helper for authenticated requests
     async function labFetch(url, options = {}) {
@@ -494,6 +639,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
+    // Mode Toggle (Scene only vs Scene + Outfit)
+    function setMode(mode) {
+      currentMode = mode;
+      document.getElementById('btnModeSceneOnly').classList.toggle('active', mode === 'scene_only');
+      document.getElementById('btnModeSceneOutfit').classList.toggle('active', mode === 'scene_outfit');
+      document.getElementById('outfitContainer').style.display = mode === 'scene_outfit' ? 'block' : 'none';
+      saveCurrentState();
+    }
+
     // Load initial state
     async function loadLabState() {
       try {
@@ -512,8 +666,13 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           }
 
           if (data.state) {
+            setMode(data.state.mode || 'scene_only');
             document.getElementById('sceneInput').value = data.state.scene || '';
+            document.getElementById('outfitInput').value = data.state.outfit || '';
             document.getElementById('seedInput').value = data.state.seed ?? 42;
+            if (data.state.outputSize) {
+              document.getElementById('kontextSizeSelect').value = data.state.outputSize;
+            }
             if (data.state.lastConfig) {
               document.getElementById('customJsonInput').value = JSON.stringify(data.state.lastConfig, null, 2);
             }
@@ -527,18 +686,21 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     // Save scene & seed state
     async function saveCurrentState() {
       const scene = document.getElementById('sceneInput').value;
+      const outfit = document.getElementById('outfitInput').value;
+      const outputSize = document.getElementById('kontextSizeSelect').value;
       const seed = parseInt(document.getElementById('seedInput').value, 10) || 42;
       try {
         await labFetch('/api/lab/state', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ scene, seed })
+          body: JSON.stringify({ mode: currentMode, scene, outfit, outputSize, seed })
         });
       } catch (err) {
         console.warn('Could not save state:', err);
       }
     }
     document.getElementById('sceneInput').addEventListener('blur', saveCurrentState);
+    document.getElementById('outfitInput').addEventListener('blur', saveCurrentState);
     document.getElementById('seedInput').addEventListener('blur', saveCurrentState);
 
     // Upload Photo
@@ -574,7 +736,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         const res = await labFetch('/api/lab/results');
         const data = await res.json();
         if (data.success && Array.isArray(data.results)) {
-          renderResults(data.results);
+          currentResults = data.results;
+          renderResults(currentResults);
         }
       } catch (err) {
         console.warn('Failed to load results:', err);
@@ -584,31 +747,73 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     function renderResults(results) {
       const countEl = document.getElementById('resultsCount');
       const gallery = document.getElementById('resultsGallery');
-      countEl.textContent = results.length + ' run' + (results.length === 1 ? '' : 's');
+      const sortVal = document.getElementById('sortSelect').value;
 
-      if (!results.length) {
+      // Sort results
+      const sorted = [...results].sort((a, b) => {
+        if (sortVal === 'rating_desc') return (b.rating || 0) - (a.rating || 0);
+        if (sortVal === 'rating_asc') return (a.rating || 0) - (b.rating || 0);
+        if (sortVal === 'oldest') return new Date(a.timestamp) - new Date(b.timestamp);
+        return new Date(b.timestamp) - new Date(a.timestamp); // newest
+      });
+
+      // Calculate running total spend
+      const totalCost = results.reduce((sum, r) => sum + (parseFloat(r.cost) || 0), 0);
+      const costStr = '$' + totalCost.toFixed(3);
+      document.getElementById('topTotalSpend').textContent = 'Total Spend: ' + costStr;
+      document.getElementById('gallerySpendTotal').textContent = costStr + ' total spend';
+
+      countEl.textContent = sorted.length + ' run' + (sorted.length === 1 ? '' : 's');
+
+      if (!sorted.length) {
         gallery.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;">No test runs yet. Run a preset above!</div>';
         return;
       }
 
-      gallery.innerHTML = results.map(r => {
+      gallery.innerHTML = sorted.map(r => {
         const origUrl = '/api/lab/original?key=' + encodeURIComponent(LAB_KEY);
         const genUrl = r.imageUrl ? (r.imageUrl.startsWith('http') ? r.imageUrl : r.imageUrl + '?key=' + encodeURIComponent(LAB_KEY)) : r.remoteUrl;
         const jsonStr = JSON.stringify(r.params || {}, null, 2);
+        const rating = r.rating || 0;
+        const notes = r.notes || '';
+        const costBadge = r.cost != null ? \`<span class="res-cost">💰 $\${parseFloat(r.cost).toFixed(3)}</span>\` : '';
+        const parentBadge = r.parentRunId ? \`<span class="res-badge" style="background:rgba(59,130,246,0.15);color:#60a5fa;">🔗 Linked to #\${r.parentRunId}</span>\` : '';
+
+        // Star buttons
+        let starsHtml = '';
+        for (let s = 1; s <= 5; s++) {
+          starsHtml += \`<button type="button" class="star-btn \${s <= rating ? 'active' : ''}" onclick="saveRating('\${r.id}', \${s})">★</button>\`;
+        }
 
         return \`
           <div class="result-card" id="card-\${r.id}">
             <div class="res-header">
               <div class="res-meta">
                 <span class="res-badge">\${r.presetLabel || r.preset || 'Run'}</span>
+                \${parentBadge}
                 <span class="res-model">\${r.model}</span>
                 <span>Seed: <strong>\${r.seed ?? 'N/A'}</strong></span>
                 <span class="res-runtime">⚡ \${r.runtime || 'N/A'}</span>
+                \${costBadge}
                 <span style="color:var(--text-muted);">\${new Date(r.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
               </div>
               <div class="res-actions">
+                <button type="button" class="res-btn realism" onclick="toggleRealismPanel('\${r.id}')">✨ Realism Pass</button>
                 <a href="\${genUrl}" download="\${r.id}.jpg" target="_blank" class="res-btn">⬇ Download</a>
                 <button type="button" class="res-btn delete" onclick="deleteRun('\${r.id}')">🗑 Delete</button>
+              </div>
+            </div>
+
+            <!-- Inline Realism Pass Controls -->
+            <div id="realismPanel-\${r.id}" class="realism-panel" style="display:none;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span style="font-size:0.75rem;font-weight:700;color:var(--amber);">Apply Sharp-Only Realism Pass</span>
+                <span id="sigmaVal-\${r.id}" style="font-size:0.75rem;color:#34d399;font-weight:700;">Grain &sigma; = 2.0</span>
+              </div>
+              <p style="font-size:0.72rem;color:var(--text-muted);margin:0;">Adds fine Gaussian film grain with subtle contrast lift. Zero upscaler hallucinations.</p>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <input type="range" id="sigmaSlider-\${r.id}" min="1.5" max="2.5" step="0.1" value="2.0" style="flex:1;accent-color:var(--amber);" oninput="document.getElementById('sigmaVal-\${r.id}').textContent = 'Grain &sigma; = ' + this.value">
+                <button type="button" class="res-btn realism" onclick="applyRealismPass('\${r.id}')">Apply & Save</button>
               </div>
             </div>
 
@@ -619,13 +824,22 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
                 <img src="\${origUrl}" class="comp-img" alt="Original Reference" />
               </div>
               <div class="comp-col">
-                <span class="comp-label">Generated Result (\${r.preset || 'Output'})</span>
+                <span class="comp-label">Generated Result (\${r.presetLabel || r.preset || 'Output'})</span>
                 <img src="\${genUrl}" class="comp-img" alt="Generated Result" onclick="window.open('\${genUrl}', '_blank')" style="cursor:zoom-in;" />
               </div>
             </div>
 
+            <!-- Star Rating & Notes Row -->
+            <div class="rating-row">
+              <div style="display:flex;align-items:center;gap:4px;">
+                <span style="font-size:0.72rem;color:var(--text-muted);font-weight:700;margin-right:4px;">RATING:</span>
+                \${starsHtml}
+              </div>
+              <input type="text" class="notes-input" placeholder="Add evaluation notes (likeness, skin, pores...)" value="\${notes.replace(/"/g, '&quot;')}" onblur="saveNotes('\${r.id}', this.value)" />
+            </div>
+
             <!-- Parameters Accordion -->
-            <details style="font-size:0.75rem;margin-top:4px;">
+            <details style="font-size:0.75rem;">
               <summary style="cursor:pointer;color:var(--amber);font-weight:600;">Show Full Parameters JSON</summary>
               <pre class="code-box" style="padding:0.75rem;border-radius:8px;margin-top:6px;overflow-x:auto;">\${jsonStr}</pre>
             </details>
@@ -634,15 +848,77 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }).join('');
     }
 
+    // Star Rating & Notes Persistence
+    async function saveRating(id, rating) {
+      try {
+        const res = await labFetch(\`/api/lab/results/\${encodeURIComponent(id)}/update\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rating })
+        });
+        const data = await res.json();
+        if (data.success) {
+          const item = currentResults.find(r => r.id === id);
+          if (item) item.rating = rating;
+          renderResults(currentResults);
+        }
+      } catch (err) {
+        console.warn('Could not save rating:', err);
+      }
+    }
+
+    async function saveNotes(id, notes) {
+      try {
+        await labFetch(\`/api/lab/results/\${encodeURIComponent(id)}/update\`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ notes })
+        });
+        const item = currentResults.find(r => r.id === id);
+        if (item) item.notes = notes;
+      } catch (err) {
+        console.warn('Could not save notes:', err);
+      }
+    }
+
+    // Toggle Realism Pass Panel
+    function toggleRealismPanel(id) {
+      const panel = document.getElementById('realismPanel-' + id);
+      if (panel) {
+        panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+      }
+    }
+
+    // Apply Realism Pass (Sharp finishing)
+    async function applyRealismPass(parentId) {
+      showError(null);
+      const slider = document.getElementById('sigmaSlider-' + parentId);
+      const sigma = parseFloat(slider?.value || 2.0);
+
+      try {
+        const res = await labFetch('/api/lab/realism-pass', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ parentRunId: parentId, sigma })
+        });
+        const data = await res.json();
+        if (!data.success) {
+          throw new Error(data.error || 'Realism pass failed.');
+        }
+        await loadResults();
+      } catch (err) {
+        showError('Realism Pass Error: ' + err.message);
+      }
+    }
+
     async function deleteRun(id) {
       if (!confirm('Delete this test run?')) return;
       try {
         const res = await labFetch('/api/lab/results/' + encodeURIComponent(id), { method: 'DELETE' });
         const data = await res.json();
         if (data.success) {
-          const card = document.getElementById('card-' + id);
-          if (card) card.remove();
-          loadResults();
+          currentResults = currentResults.filter(r => r.id !== id);
+          renderResults(currentResults);
         } else {
           alert('Delete failed: ' + (data.error || 'Unknown error'));
         }
@@ -651,16 +927,33 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
+    // Checkbox Preset Selection
+    function updateSelectedCount() {
+      const all = ['A', 'B', 'C', 'D', 'E', 'F'];
+      const selected = all.filter(p => document.getElementById('chkPreset' + p)?.checked);
+      document.getElementById('runSelectedLabel').textContent = \`⚡ Run Selected Presets (\${selected.length} of \${all.length} Selected)\`;
+    }
+
+    function toggleAllPresets(checked) {
+      ['A', 'B', 'C', 'D', 'E', 'F'].forEach(p => {
+        const chk = document.getElementById('chkPreset' + p);
+        if (chk) chk.checked = checked;
+      });
+      updateSelectedCount();
+    }
+
     // Running Presets
     async function executeRun(preset, customConfig = null) {
       showError(null);
       const scene = document.getElementById('sceneInput').value;
+      const outfit = document.getElementById('outfitInput').value;
+      const outputSize = document.getElementById('kontextSizeSelect').value;
       const seed = parseInt(document.getElementById('seedInput').value, 10) || 42;
 
       const res = await labFetch('/api/lab/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preset, scene, seed, customConfig })
+        body: JSON.stringify({ preset, mode: currentMode, scene, outfit, outputSize, seed, customConfig })
       });
       const data = await res.json();
       if (!data.success) {
@@ -670,26 +963,26 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
 
     function setButtonsDisabled(disabled) {
-      document.querySelectorAll('.preset-btn, #btnRunAll, #btnRunCustom').forEach(b => b.disabled = disabled);
+      document.querySelectorAll('.preset-btn, #btnRunSelected, #btnRunCustom').forEach(b => b.disabled = disabled);
     }
 
     async function runPreset(preset) {
       setButtonsDisabled(true);
       showError(null);
       const btn = document.getElementById('btnPreset' + preset);
-      const oldText = btn.innerHTML;
-      btn.innerHTML = '<div><div class="p-tag">RUNNING...</div><div class="p-title">Processing Fal API</div><div class="p-desc">Please wait...</div></div>';
+      const oldHtml = btn.innerHTML;
+      btn.innerHTML = '<div class="p-title" style="color:var(--amber);">⏳ Running Model...</div><div class="p-desc">Processing Fal API subscription...</div>';
 
       try {
         const result = await executeRun(preset);
-        loadResults();
+        await loadResults();
         if (result && result.params) {
           document.getElementById('customJsonInput').value = JSON.stringify({ model: result.model, input: result.params }, null, 2);
         }
       } catch (err) {
         showError('Preset ' + preset + ' Error: ' + err.message);
       } finally {
-        btn.innerHTML = oldText;
+        btn.innerHTML = oldHtml;
         setButtonsDisabled(false);
       }
     }
@@ -703,8 +996,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       try {
         const rawJson = document.getElementById('customJsonInput').value;
         const parsed = JSON.parse(rawJson);
-        const result = await executeRun('custom', parsed);
-        loadResults();
+        await executeRun('custom', parsed);
+        await loadResults();
       } catch (err) {
         showError('Custom Run Error: ' + err.message);
       } finally {
@@ -713,7 +1006,22 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    async function runAllSequential() {
+    async function runSelectedSequential() {
+      const allPresets = [
+        { id: 'A', name: 'Preset A (Flux-Pro Kontext)' },
+        { id: 'B', name: 'Preset B (PuLID 0.9)' },
+        { id: 'C', name: 'Preset C (PuLID 0.8)' },
+        { id: 'D', name: 'Preset D (Kontext + Upscale + Grain)' },
+        { id: 'E', name: 'Preset E (Nano Banana Edit)' },
+        { id: 'F', name: 'Preset F (Seedream Edit)' }
+      ];
+
+      const queue = allPresets.filter(p => document.getElementById('chkPreset' + p.id)?.checked);
+      if (!queue.length) {
+        alert('Please select at least one preset to run.');
+        return;
+      }
+
       setButtonsDisabled(true);
       showError(null);
       const progressText = document.getElementById('runProgressText');
@@ -722,13 +1030,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
       progressText.style.display = 'block';
       progressBar.style.display = 'block';
-
-      const queue = [
-        { id: 'A', name: 'Preset A (Flux-Pro Kontext)' },
-        { id: 'B', name: 'Preset B (PuLID 0.9)' },
-        { id: 'C', name: 'Preset C (PuLID 0.8)' },
-        { id: 'D', name: 'Preset D (Kontext + Upscale + Grain)' }
-      ];
 
       for (let i = 0; i < queue.length; i++) {
         const item = queue[i];
@@ -745,7 +1046,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
 
       progressFill.style.width = '100%';
-      progressText.textContent = '✅ All 4 baseline tests completed!';
+      progressText.textContent = \`✅ All \${queue.length} selected tests completed!\`;
       setTimeout(() => {
         progressText.style.display = 'none';
         progressBar.style.display = 'none';
@@ -757,22 +1058,24 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     function populateCustomPreset(preset) {
       const scene = document.getElementById('sceneInput').value;
+      const outfit = document.getElementById('outfitInput').value;
       const seed = parseInt(document.getElementById('seedInput').value, 10) || 42;
+      let editPrompt = currentMode === 'scene_outfit' && outfit
+        ? \`Change the background to \${scene} and change the outfit to \${outfit}. Keep the person's face, hair, pose and expression exactly identical. Natural unretouched photo.\`
+        : \`Change only the background to \${scene}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo.\`;
+
       let cfg = {};
 
       if (preset === 'A') {
         cfg = {
           model: 'fal-ai/flux-pro/kontext',
-          input: {
-            prompt: 'Change only the background to ' + scene + '. Keep the person\\'s face, hair, outfit, pose and expression exactly identical. Natural unretouched photo, realistic skin texture.',
-            seed: seed
-          }
+          input: { prompt: editPrompt, seed: seed }
         };
       } else if (preset === 'B') {
         cfg = {
           model: 'fal-ai/flux-pulid',
           input: {
-            prompt: scene + ', Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details',
+            prompt: scene + (outfit ? ', ' + outfit : '') + ', Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details',
             id_weight: 0.9,
             guidance_scale: 2.8,
             start_step: 1,
@@ -786,7 +1089,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         cfg = {
           model: 'fal-ai/flux-pulid',
           input: {
-            prompt: scene + ', Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details',
+            prompt: scene + (outfit ? ', ' + outfit : '') + ', Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details',
             id_weight: 0.8,
             guidance_scale: 2.5,
             start_step: 2,
@@ -795,6 +1098,16 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
             seed: seed,
             max_sequence_length: '256'
           }
+        };
+      } else if (preset === 'E') {
+        cfg = {
+          model: 'fal-ai/nano-banana/edit',
+          input: { prompt: editPrompt, num_images: 1, seed: seed }
+        };
+      } else if (preset === 'F') {
+        cfg = {
+          model: 'fal-ai/bytedance/seedream/v4.5/edit',
+          input: { prompt: editPrompt, num_images: 1, seed: seed }
         };
       }
       document.getElementById('customJsonInput').value = JSON.stringify(cfg, null, 2);
@@ -830,8 +1143,8 @@ router.get('/api/lab/state', labAuthMiddleware, (req, res) => {
  */
 router.post('/api/lab/state', labAuthMiddleware, (req, res) => {
   try {
-    const { scene, seed, lastConfig } = req.body;
-    const updated = saveLabState({ scene, seed, lastConfig });
+    const { mode, scene, outfit, outputSize, seed, lastConfig } = req.body;
+    const updated = saveLabState({ mode, scene, outfit, outputSize, seed, lastConfig });
     res.json({ success: true, state: updated });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -898,6 +1211,95 @@ router.get('/api/lab/results', labAuthMiddleware, (req, res) => {
 });
 
 /**
+ * POST /api/lab/results/:id/update
+ * Update rating (1-5) and/or notes
+ */
+router.post('/api/lab/results/:id/update', labAuthMiddleware, (req, res) => {
+  try {
+    const id = req.params.id;
+    const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
+    if (!fs.existsSync(jsonPath)) {
+      return res.status(404).json({ success: false, error: 'Run record not found' });
+    }
+
+    const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    if (req.body.rating !== undefined) data.rating = parseInt(req.body.rating, 10) || 0;
+    if (req.body.notes !== undefined) data.notes = req.body.notes;
+
+    fs.writeFileSync(jsonPath, JSON.stringify(data, null, 2), 'utf8');
+    res.json({ success: true, result: data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/lab/realism-pass
+ * Sharp-only finishing (grain sigma 1.5-2.5, slight contrast lift, no upscaler)
+ */
+router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
+  try {
+    const { parentRunId, sigma = 2.0 } = req.body;
+    const parentJpg = path.join(RESULTS_DIR, `${parentRunId}.jpg`);
+    const parentPng = path.join(RESULTS_DIR, `${parentRunId}.png`);
+
+    let parentFilePath = fs.existsSync(parentJpg) ? parentJpg : (fs.existsSync(parentPng) ? parentPng : null);
+    if (!parentFilePath) {
+      return res.status(404).json({ success: false, error: 'Parent image not found.' });
+    }
+
+    console.log(`[LAB REALISM PASS] Applying to ${parentRunId} with sigma ${sigma}...`);
+    const parentBuffer = fs.readFileSync(parentFilePath);
+
+    // 1. Subtle contrast lift via sharp linear transformation
+    const contrastLifted = await sharp(parentBuffer)
+      .linear(1.05, -2) // 5% slope increase with minimal shadow offset
+      .toBuffer();
+
+    // 2. Sharp Gaussian film grain with specified sigma
+    const grainBuffer = await applySharpFilmGrain(contrastLifted, parseFloat(sigma));
+
+    // 3. Save as new result linked to parent
+    const runId = `run_${Date.now()}`;
+    const localFileName = `${runId}.jpg`;
+    fs.writeFileSync(path.join(RESULTS_DIR, localFileName), grainBuffer);
+
+    // Read parent json if exists
+    let parentSeed = 42;
+    try {
+      const parentJson = JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${parentRunId}.json`), 'utf8'));
+      parentSeed = parentJson.seed || 42;
+    } catch {}
+
+    const newRecord = {
+      id: runId,
+      preset: 'realism_pass',
+      presetLabel: `Realism Pass (σ=${sigma})`,
+      parentRunId,
+      model: `sharp-finishing (grain σ=${sigma} + contrast lift)`,
+      params: {
+        parentRunId,
+        grain_sigma: sigma,
+        contrast_lift: 1.05
+      },
+      seed: parentSeed,
+      runtime: '0.3s',
+      cost: 0.000,
+      timestamp: new Date().toISOString(),
+      imageUrl: `/api/lab/results/${localFileName}`,
+      rating: 0,
+      notes: `Realism pass applied to run ${parentRunId}`
+    };
+
+    fs.writeFileSync(path.join(RESULTS_DIR, `${runId}.json`), JSON.stringify(newRecord, null, 2), 'utf8');
+    res.json({ success: true, result: newRecord });
+  } catch (err) {
+    console.error('[LAB REALISM PASS ERROR]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
  * GET /api/lab/results/:filename
  * Serve locally saved generated image
  */
@@ -944,10 +1346,10 @@ router.delete('/api/lab/results/:id', labAuthMiddleware, (req, res) => {
  */
 router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
   const startTime = Date.now();
-  const { preset, scene, seed, customConfig } = req.body;
+  const { preset, mode, scene, outfit, outputSize, seed, customConfig } = req.body;
   const numSeed = parseInt(seed, 10) || 42;
 
-  console.log(`[LAB RUN START] Preset: ${preset}, Seed: ${numSeed}, Time: ${new Date().toISOString()}`);
+  console.log(`[LAB RUN START] Preset: ${preset}, Mode: ${mode}, Seed: ${numSeed}`);
 
   if (!fs.existsSync(ORIGINAL_PHOTO_PATH)) {
     return res.status(400).json({
@@ -971,24 +1373,50 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     const photoBuffer = fs.readFileSync(ORIGINAL_PHOTO_PATH);
     const photoUrl = await uploadToFalStorage(photoBuffer, 'image/jpeg');
 
+    // Compose prompt based on "Scene only" vs "Scene + outfit change"
+    let editPrompt = '';
+    if (mode === 'scene_outfit' && outfit && outfit.trim()) {
+      editPrompt = `Change the background to ${scene.trim()} and change the outfit to ${outfit.trim()}. Keep the person's face, hair, pose and expression exactly identical. Natural unretouched photo.`;
+    } else {
+      editPrompt = `Change only the background to ${scene.trim()}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo.`;
+    }
+
     let modelId = '';
     let modelInput = {};
     let presetLabel = '';
     let isPipelineD = false;
+    let estimatedCost = 0.040;
+
+    // Map output size
+    let kontextDimensions = null;
+    let aspectEnum = 'auto';
+    if (outputSize === '4:5') {
+      kontextDimensions = { width: 1080, height: 1350 };
+      aspectEnum = '4:5';
+    } else if (outputSize === '9:16') {
+      kontextDimensions = { width: 1080, height: 1920 };
+      aspectEnum = '9:16';
+    }
 
     if (preset === 'A') {
       presetLabel = 'Preset A (Flux-Pro Kontext)';
       modelId = 'fal-ai/flux-pro/kontext';
       modelInput = {
-        prompt: `Change only the background to ${scene}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo, realistic skin texture.`,
+        prompt: editPrompt,
         image_url: photoUrl,
         seed: numSeed
       };
+      if (kontextDimensions) modelInput.image_size = kontextDimensions;
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'];
     } else if (preset === 'B') {
       presetLabel = 'Preset B (PuLID 0.9)';
       modelId = 'fal-ai/flux-pulid';
+      const pulidPrompt = mode === 'scene_outfit' && outfit
+        ? `${scene}, wearing ${outfit}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`
+        : `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`;
+
       modelInput = {
-        prompt: `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`,
+        prompt: pulidPrompt,
         reference_image_url: photoUrl,
         id_weight: 0.9,
         guidance_scale: 2.8,
@@ -996,15 +1424,20 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
         true_cfg: 1.2,
         num_inference_steps: 35,
         seed: numSeed,
-        image_size: { width: 1080, height: 1350 },
+        image_size: kontextDimensions || { width: 1080, height: 1350 },
         max_sequence_length: '256',
         enable_safety_checker: true
       };
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
     } else if (preset === 'C') {
       presetLabel = 'Preset C (PuLID 0.8 Natural)';
       modelId = 'fal-ai/flux-pulid';
+      const pulidPrompt = mode === 'scene_outfit' && outfit
+        ? `${scene}, wearing ${outfit}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`
+        : `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`;
+
       modelInput = {
-        prompt: `${scene}, Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.`,
+        prompt: pulidPrompt,
         reference_image_url: photoUrl,
         id_weight: 0.8,
         guidance_scale: 2.5,
@@ -1012,44 +1445,90 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
         true_cfg: 1.0,
         num_inference_steps: 40,
         seed: numSeed,
-        image_size: { width: 1080, height: 1350 },
+        image_size: kontextDimensions || { width: 1080, height: 1350 },
         max_sequence_length: '256',
         enable_safety_checker: true
       };
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
     } else if (preset === 'D') {
       presetLabel = 'Preset D (Kontext + Upscaler 0.2 + Film Grain σ=2)';
       modelId = 'fal-ai/flux-pro/kontext';
       modelInput = {
-        prompt: `Change only the background to ${scene}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo, realistic skin texture.`,
+        prompt: editPrompt,
         image_url: photoUrl,
         seed: numSeed
       };
+      if (kontextDimensions) modelInput.image_size = kontextDimensions;
       isPipelineD = true;
+      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
+    } else if (preset === 'E') {
+      presetLabel = 'Preset E (Nano Banana Edit)';
+      modelId = 'fal-ai/nano-banana/edit';
+      modelInput = {
+        prompt: editPrompt,
+        image_urls: [photoUrl],
+        image_url: photoUrl,
+        num_images: 1,
+        seed: numSeed
+      };
+      if (aspectEnum !== 'auto') modelInput.aspect_ratio = aspectEnum;
+      estimatedCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
+    } else if (preset === 'F') {
+      presetLabel = 'Preset F (Seedream Edit)';
+      modelId = 'fal-ai/bytedance/seedream/v4.5/edit';
+      modelInput = {
+        prompt: editPrompt,
+        image_urls: [photoUrl],
+        image_url: photoUrl,
+        num_images: 1,
+        seed: numSeed
+      };
+      estimatedCost = MODEL_PRICING['fal-ai/bytedance/seedream/v4.5/edit'];
     } else if (preset === 'custom' && customConfig) {
       presetLabel = 'Custom Run';
       modelId = customConfig.model || 'fal-ai/flux-pulid';
       modelInput = { ...customConfig.input };
       // Inject photo if not explicitly provided
-      if (!modelInput.image_url && !modelInput.reference_image_url) {
+      if (!modelInput.image_url && !modelInput.reference_image_url && !modelInput.image_urls) {
         if (modelId.includes('kontext')) {
+          modelInput.image_url = photoUrl;
+        } else if (modelId.includes('banana') || modelId.includes('seedream')) {
+          modelInput.image_urls = [photoUrl];
           modelInput.image_url = photoUrl;
         } else {
           modelInput.reference_image_url = photoUrl;
         }
       }
       if (!modelInput.seed) modelInput.seed = numSeed;
+      estimatedCost = MODEL_PRICING[modelId] || 0.035;
     } else {
       throw new Error(`Unknown preset: ${preset}`);
     }
 
     console.log(`[LAB RUN] Subscribing to ${modelId}...`);
-    const result = await fal.subscribe(modelId, { input: modelInput });
+    let result = null;
+    try {
+      result = await fal.subscribe(modelId, { input: modelInput });
+    } catch (primaryErr) {
+      // If Seedream 4.5 is unavailable, gracefully fall back to 4.0
+      if (preset === 'F' && (primaryErr.status === 404 || primaryErr.message?.includes('not found') || primaryErr.body?.detail?.includes('not found'))) {
+        console.warn('[LAB] Seedream v4.5 not found, falling back to fal-ai/bytedance/seedream/v4/edit');
+        modelId = 'fal-ai/bytedance/seedream/v4/edit';
+        result = await fal.subscribe(modelId, { input: modelInput });
+      } else {
+        throw primaryErr;
+      }
+    }
+
     const images = result.data?.images || result.images;
     let finalImageUrl = images?.[0]?.url || result.data?.image?.url || result.image?.url;
 
     if (!finalImageUrl) {
       throw new Error(`No image URL returned by ${modelId}. Result structure: ` + JSON.stringify(result));
     }
+
+    // Capture actual cost if returned by Fal API
+    const actualCost = result.data?.usage?.cost ?? result.usage?.cost ?? result.data?.cost ?? estimatedCost;
 
     // Preset D Multi-stage: Pass through clarity upscaler + apply sharp film grain
     if (isPipelineD) {
@@ -1095,23 +1574,29 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
       params: modelInput,
       seed: modelInput.seed ?? numSeed,
       runtime: runtimeStr,
+      cost: typeof actualCost === 'number' ? actualCost : parseFloat(actualCost) || estimatedCost,
       timestamp: new Date().toISOString(),
       imageUrl: `/api/lab/results/${localFileName}`,
       remoteUrl: finalImageUrl,
-      hasOriginal: true
+      hasOriginal: true,
+      rating: 0,
+      notes: ''
     };
 
     // Save JSON record
     fs.writeFileSync(path.join(RESULTS_DIR, `${runId}.json`), JSON.stringify(resultRecord, null, 2), 'utf8');
 
-    // Update state.json with latest scene, seed, and lastConfig
+    // Update state.json with latest settings
     saveLabState({
+      mode,
       scene,
+      outfit,
+      outputSize,
       seed: numSeed,
       lastConfig: { model: modelId, input: modelInput }
     });
 
-    console.log(`[LAB RUN COMPLETE] ${runId} in ${runtimeStr}`);
+    console.log(`[LAB RUN COMPLETE] ${runId} in ${runtimeStr} ($${resultRecord.cost})`);
     res.json({ success: true, result: resultRecord });
 
   } catch (error) {
