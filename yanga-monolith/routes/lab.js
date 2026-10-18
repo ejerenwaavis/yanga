@@ -3,8 +3,12 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import { fal } from '@fal-ai/client';
 import sharp from 'sharp';
+
+const require = createRequire(import.meta.url);
+const archiver = require('archiver');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,6 +26,11 @@ if (!fs.existsSync(LAB_DATA_DIR)) {
 if (!fs.existsSync(RESULTS_DIR)) {
   fs.mkdirSync(RESULTS_DIR, { recursive: true });
 }
+
+// In-memory registry of active jobs and deleted runs to prevent race conditions
+const activeJobs = new Map();
+const deletedRunIds = new Set();
+const recentRunRequests = new Map(); // deduplication cache: key -> timestamp
 
 // Startup Cleanup: Mark any dangling runs left in "running" or "queued" as "interrupted"
 function cleanupDanglingRunsOnStartup() {
@@ -49,9 +58,6 @@ function cleanupDanglingRunsOnStartup() {
 }
 cleanupDanglingRunsOnStartup();
 
-// Active background jobs registry: runId -> { timeoutId, isCanceled }
-const activeJobs = new Map();
-
 // Multer memory storage for original photo uploads
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
@@ -68,6 +74,46 @@ const MODEL_PRICING = {
   'fal-ai/bytedance/seedream/v4/edit': 0.020,
   'realism_pass': 0.000
 };
+
+/**
+ * Detect original photo dimensions and map closest Fal aspect ratio
+ */
+async function getOriginalPhotoMetadata() {
+  try {
+    if (!fs.existsSync(ORIGINAL_PHOTO_PATH)) {
+      return { width: 1080, height: 1350, ratio: 1080 / 1350, ratioEnum: '4:5' };
+    }
+    const meta = await sharp(ORIGINAL_PHOTO_PATH).metadata();
+    const w = meta.width || 1080;
+    const h = meta.height || 1350;
+    const ratio = w / h;
+
+    const options = [
+      { id: '9:16', val: 9 / 16 },
+      { id: '3:4', val: 3 / 4 },
+      { id: '4:5', val: 4 / 5 },
+      { id: '1:1', val: 1.0 },
+      { id: '4:3', val: 4 / 3 },
+      { id: '16:9', val: 16 / 9 },
+      { id: '21:9', val: 21 / 9 }
+    ];
+
+    let closest = options[0];
+    let minDiff = Math.abs(ratio - closest.val);
+    for (const opt of options) {
+      const diff = Math.abs(ratio - opt.val);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closest = opt;
+      }
+    }
+
+    return { width: w, height: h, ratio, ratioEnum: closest.id };
+  } catch (err) {
+    console.warn('[LAB] Could not read original photo metadata:', err.message);
+    return { width: 1080, height: 1350, ratio: 0.8, ratioEnum: '4:5' };
+  }
+}
 
 /**
  * Read or initialize state.json
@@ -122,17 +168,24 @@ function saveLabState(updates) {
 }
 
 /**
- * Helper to update a specific run's JSON record
+ * Helper to update a specific run's JSON record safely
+ * Skips write if the run was deleted by the user
  */
 function updateRunRecord(id, updates) {
+  if (deletedRunIds.has(id)) {
+    console.log(`[LAB] updateRunRecord skipped: run ${id} was deleted.`);
+    return null;
+  }
   try {
     const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
-    if (fs.existsSync(jsonPath)) {
-      const current = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
-      const updated = { ...current, ...updates };
-      fs.writeFileSync(jsonPath, JSON.stringify(updated, null, 2), 'utf8');
-      return updated;
+    if (!fs.existsSync(jsonPath)) {
+      console.log(`[LAB] updateRunRecord skipped: ${jsonPath} no longer exists.`);
+      return null;
     }
+    const current = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    const updated = { ...current, ...updates };
+    fs.writeFileSync(jsonPath, JSON.stringify(updated, null, 2), 'utf8');
+    return updated;
   } catch (err) {
     console.error(`[LAB] Error updating run record ${id}:`, err);
   }
@@ -140,7 +193,34 @@ function updateRunRecord(id, updates) {
 }
 
 /**
- * Upload buffer or file to Fal Storage with fallback to Base64 data URI
+ * Helper to permanently remove a run from memory and disk
+ */
+function deleteRunFromDisk(id) {
+  deletedRunIds.add(id);
+
+  // Cancel any running job
+  const job = activeJobs.get(id);
+  if (job) {
+    job.isCanceled = true;
+    if (job.timeoutId) clearTimeout(job.timeoutId);
+    activeJobs.delete(id);
+  }
+
+  const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
+  const imgJpg = path.join(RESULTS_DIR, `${id}.jpg`);
+  const imgPng = path.join(RESULTS_DIR, `${id}.png`);
+
+  let deleted = false;
+  if (fs.existsSync(jsonPath)) { fs.unlinkSync(jsonPath); deleted = true; }
+  if (fs.existsSync(imgJpg)) { fs.unlinkSync(imgJpg); deleted = true; }
+  if (fs.existsSync(imgPng)) { fs.unlinkSync(imgPng); deleted = true; }
+
+  console.log(`[LAB DISK DELETE] Run ${id} removed permanently from disk.`);
+  return deleted;
+}
+
+/**
+ * Upload buffer to Fal Storage with fallback to Base64 data URI
  */
 async function uploadToFalStorage(buffer, mimeType = 'image/jpeg') {
   try {
@@ -273,9 +353,12 @@ export function labAuthMiddleware(req, res, next) {
 }
 
 /**
- * Detached Asynchronous Background Worker for a single run
+ * Detached Asynchronous Background Worker
+ * Checks deletedRunIds before each stage and before writing to disk
  */
 async function processRunJob(runId, jobParams) {
+  if (deletedRunIds.has(runId)) return;
+
   const { preset, mode, scene, outfit, outputSize, seed, customConfig, falKey } = jobParams;
   const numSeed = parseInt(seed, 10) || 42;
   const startTime = Date.now();
@@ -286,7 +369,7 @@ async function processRunJob(runId, jobParams) {
   // 180 Second Timeout
   const timeoutId = setTimeout(() => {
     const job = activeJobs.get(runId);
-    if (job && !job.isCanceled) {
+    if (job && !job.isCanceled && !deletedRunIds.has(runId)) {
       job.isCanceled = true;
       console.warn(`[LAB TIMEOUT] Run ${runId} timed out after 180 seconds.`);
       updateRunRecord(runId, {
@@ -306,7 +389,10 @@ async function processRunJob(runId, jobParams) {
     const photoBuffer = fs.readFileSync(ORIGINAL_PHOTO_PATH);
     const photoUrl = await uploadToFalStorage(photoBuffer, 'image/jpeg');
 
-    if (activeJobs.get(runId)?.isCanceled) return;
+    if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
+
+    // Detect original aspect ratio for matching
+    const origMeta = await getOriginalPhotoMetadata();
 
     let editPrompt = '';
     if (mode === 'scene_outfit' && outfit && outfit.trim()) {
@@ -321,20 +407,28 @@ async function processRunJob(runId, jobParams) {
     let isPipelineD = false;
     let estimatedCost = 0.040;
 
+    // Map output size explicitly
     let kontextDimensions = null;
-    let aspectEnum = 'auto';
+    let aspectEnum = origMeta.ratioEnum; // default match original
+
     if (outputSize === '4:5') {
       kontextDimensions = { width: 1080, height: 1350 };
       aspectEnum = '4:5';
     } else if (outputSize === '9:16') {
       kontextDimensions = { width: 1080, height: 1920 };
       aspectEnum = '9:16';
+    } else if (outputSize === 'match_original') {
+      // FIX FOR PRESET D & A SQUARE BUG: Pass explicit aspect_ratio matching original photo!
+      aspectEnum = origMeta.ratioEnum;
+      if (aspectEnum === '9:16') kontextDimensions = { width: 1080, height: 1920 };
+      else if (aspectEnum === '4:5') kontextDimensions = { width: 1080, height: 1350 };
+      else if (aspectEnum === '3:4') kontextDimensions = { width: 1080, height: 1440 };
     }
 
     if (preset === 'A') {
       presetLabel = 'Preset A (Flux-Pro Kontext)';
       modelId = 'fal-ai/flux-pro/kontext';
-      modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed };
+      modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed, aspect_ratio: aspectEnum };
       if (kontextDimensions) modelInput.image_size = kontextDimensions;
       estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'];
     } else if (preset === 'B') {
@@ -353,7 +447,7 @@ async function processRunJob(runId, jobParams) {
         true_cfg: 1.2,
         num_inference_steps: 35,
         seed: numSeed,
-        image_size: kontextDimensions || { width: 1080, height: 1350 },
+        image_size: kontextDimensions || (aspectEnum === '9:16' ? 'portrait_16_9' : { width: 1080, height: 1350 }),
         max_sequence_length: '256',
         enable_safety_checker: true
       };
@@ -374,7 +468,7 @@ async function processRunJob(runId, jobParams) {
         true_cfg: 1.0,
         num_inference_steps: 40,
         seed: numSeed,
-        image_size: kontextDimensions || { width: 1080, height: 1350 },
+        image_size: kontextDimensions || (aspectEnum === '9:16' ? 'portrait_16_9' : { width: 1080, height: 1350 }),
         max_sequence_length: '256',
         enable_safety_checker: true
       };
@@ -382,15 +476,14 @@ async function processRunJob(runId, jobParams) {
     } else if (preset === 'D') {
       presetLabel = 'Preset D (Kontext + Upscaler 0.2 + Film Grain σ=2)';
       modelId = 'fal-ai/flux-pro/kontext';
-      modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed };
+      modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed, aspect_ratio: aspectEnum };
       if (kontextDimensions) modelInput.image_size = kontextDimensions;
       isPipelineD = true;
       estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
     } else if (preset === 'E') {
       presetLabel = 'Preset E (Nano Banana Edit)';
       modelId = 'fal-ai/nano-banana/edit';
-      modelInput = { prompt: editPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed };
-      if (aspectEnum !== 'auto') modelInput.aspect_ratio = aspectEnum;
+      modelInput = { prompt: editPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed, aspect_ratio: aspectEnum };
       estimatedCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
     } else if (preset === 'F') {
       presetLabel = 'Preset F (Seedream Edit)';
@@ -404,6 +497,7 @@ async function processRunJob(runId, jobParams) {
       if (!modelInput.image_url && !modelInput.reference_image_url && !modelInput.image_urls) {
         if (modelId.includes('kontext')) {
           modelInput.image_url = photoUrl;
+          if (!modelInput.aspect_ratio) modelInput.aspect_ratio = aspectEnum;
         } else if (modelId.includes('banana') || modelId.includes('seedream')) {
           modelInput.image_urls = [photoUrl];
           modelInput.image_url = photoUrl;
@@ -415,7 +509,7 @@ async function processRunJob(runId, jobParams) {
       estimatedCost = MODEL_PRICING[modelId] || 0.035;
     }
 
-    if (activeJobs.get(runId)?.isCanceled) return;
+    if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
 
     let result = null;
     try {
@@ -430,7 +524,7 @@ async function processRunJob(runId, jobParams) {
       }
     }
 
-    if (activeJobs.get(runId)?.isCanceled) return;
+    if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
 
     const images = result.data?.images || result.images;
     let finalImageUrl = images?.[0]?.url || result.data?.image?.url || result.image?.url;
@@ -442,7 +536,7 @@ async function processRunJob(runId, jobParams) {
 
     // Preset D multi-stage
     if (isPipelineD) {
-      console.log(`[LAB WORKER D] Stage 2: Passing to fal-ai/clarity-upscaler...`);
+      console.log(`[LAB WORKER D] Stage 2: Passing to fal-ai/clarity-upscaler with aspect preservation...`);
       const upscaleResult = await fal.subscribe('fal-ai/clarity-upscaler', {
         input: {
           image_url: finalImageUrl,
@@ -456,7 +550,7 @@ async function processRunJob(runId, jobParams) {
       if (upscaledUrl) finalImageUrl = upscaledUrl;
     }
 
-    if (activeJobs.get(runId)?.isCanceled) return;
+    if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
 
     const imgResponse = await fetch(finalImageUrl);
     let finalBuffer = Buffer.from(await imgResponse.arrayBuffer());
@@ -466,6 +560,15 @@ async function processRunJob(runId, jobParams) {
       finalBuffer = await applySharpFilmGrain(finalBuffer, 2.0);
     }
 
+    if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
+
+    // Measure output dimensions
+    const genMeta = await sharp(finalBuffer).metadata();
+    const genW = genMeta.width || 0;
+    const genH = genMeta.height || 0;
+    const genRatio = genH ? (genW / genH) : 1;
+    const aspectMismatch = Math.abs(genRatio - origMeta.ratio) > 0.08;
+
     const localFileName = `${runId}.jpg`;
     const localFilePath = path.join(RESULTS_DIR, localFileName);
     fs.writeFileSync(localFilePath, finalBuffer);
@@ -473,7 +576,7 @@ async function processRunJob(runId, jobParams) {
     const runtimeMs = Date.now() - startTime;
     const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
 
-    // Mark as done
+    // Mark as done on disk
     updateRunRecord(runId, {
       status: 'done',
       model: isPipelineD ? 'flux-pro/kontext + clarity-upscaler + film grain' : modelId,
@@ -482,7 +585,10 @@ async function processRunJob(runId, jobParams) {
       runtime: runtimeStr,
       cost: typeof actualCost === 'number' ? actualCost : parseFloat(actualCost) || estimatedCost,
       imageUrl: `/api/lab/results/${localFileName}`,
-      remoteUrl: finalImageUrl
+      remoteUrl: finalImageUrl,
+      dimensions: { width: genW, height: genH },
+      origDimensions: { width: origMeta.width, height: origMeta.height },
+      aspectMismatch
     });
 
     saveLabState({
@@ -494,13 +600,9 @@ async function processRunJob(runId, jobParams) {
       lastConfig: { model: modelId, input: modelInput }
     });
 
-    console.log(`[LAB WORKER DONE] ${runId} in ${runtimeStr}`);
+    console.log(`[LAB WORKER DONE] ${runId} (${genW}x${genH}) in ${runtimeStr}`);
   } catch (error) {
-    const job = activeJobs.get(runId);
-    if (job?.isCanceled) {
-      console.log(`[LAB WORKER] Run ${runId} canceled by user.`);
-      return;
-    }
+    if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
 
     const runtimeMs = Date.now() - startTime;
     const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
@@ -544,7 +646,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); color: var(--text); font-family: var(--font); line-height: 1.5; padding: 1rem; min-height: 100vh; }
-    .container { max-width: 1060px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.5rem; }
+    .container { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: 1.5rem; }
     
     /* Top Bar */
     .topbar { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem; background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; font-size: 0.8rem; flex-wrap: wrap; gap: 8px; }
@@ -577,16 +679,18 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     /* Preset Grid */
     .presets-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }
-    .preset-card { background: #1c1c21; border: 1px solid #2e2e36; border-radius: 10px; padding: 0.9rem; transition: all 0.15s; display: flex; flex-direction: column; justify-content: space-between; position: relative; }
+    .preset-card { background: #1c1c21; border: 1px solid #2e2e36; border-radius: 10px; padding: 0.9rem; transition: all 0.15s; display: flex; flex-direction: column; justify-content: space-between; position: relative; cursor: pointer; user-select: none; }
     .preset-card:hover { border-color: var(--amber); }
-    .preset-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
-    .preset-checkbox { width: 16px; height: 16px; accent-color: var(--amber); cursor: pointer; }
-    .preset-btn { background: transparent; border: none; text-align: left; cursor: pointer; padding: 0; width: 100%; color: inherit; }
-    .preset-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .preset-card.selected { border-color: var(--amber); background: rgba(245,158,11,0.06); }
+    .preset-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; pointer-events: none; }
+    .preset-checkbox { width: 18px; height: 18px; accent-color: var(--amber); cursor: pointer; pointer-events: auto; }
     .p-tag { font-size: 0.7rem; font-weight: 800; color: var(--amber); text-transform: uppercase; }
     .p-cost { font-size: 0.7rem; color: #34d399; font-weight: 600; }
     .p-title { font-size: 0.85rem; font-weight: 700; color: #fff; line-height: 1.3; margin: 4px 0; }
-    .p-desc { font-size: 0.72rem; color: var(--text-muted); line-height: 1.4; }
+    .p-desc { font-size: 0.72rem; color: var(--text-muted); line-height: 1.4; margin-bottom: 8px; }
+    .run-only-btn { background: #27272a; border: 1px solid #3f3f46; color: #fff; padding: 4px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; transition: background 0.15s; pointer-events: auto; }
+    .run-only-btn:hover { background: var(--amber); color: #000; border-color: var(--amber); }
+    .run-only-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
     /* Run Selected Button */
     .btn-run-all { background: linear-gradient(135deg, #f59e0b, #d97706); color: #000; font-weight: 800; font-size: 0.9rem; padding: 0.85rem 1.25rem; border: none; border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: opacity 0.15s; box-shadow: 0 4px 14px rgba(245,158,11,0.25); }
@@ -600,7 +704,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     /* Results Gallery */
     .results-gallery { display: flex; flex-direction: column; gap: 1.5rem; }
-    .result-card { background: #141417; border: 1px solid var(--card-border); border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; transition: border-color 0.2s; }
+    .result-card { background: #141417; border: 1px solid var(--card-border); border-radius: 14px; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; transition: border-color 0.2s; position: relative; }
     .result-card.running { border-color: var(--amber); }
     .result-card.failed { border-color: rgba(239,68,68,0.5); background: #181113; }
     .res-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; border-bottom: 1px solid #222; padding-bottom: 0.75rem; }
@@ -608,8 +712,10 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .res-badge { padding: 2px 8px; border-radius: 6px; background: rgba(245,158,11,0.15); color: var(--amber); font-weight: 700; font-size: 0.72rem; }
     .res-model { padding: 2px 8px; border-radius: 6px; background: #27272a; color: #d4d4d8; font-family: monospace; font-size: 0.7rem; }
     .res-runtime { color: #10b981; font-weight: 600; }
+    .res-dims { background: #27272a; color: #e4e4e7; padding: 2px 6px; border-radius: 4px; font-mono; font-size: 0.7rem; }
     .res-cost { color: #34d399; font-weight: 700; }
-    .res-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .mismatch-badge { background: #713f12; border: 1px solid #eab308; color: #fef08a; padding: 2px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; }
+    .res-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .res-btn { background: #27272a; border: 1px solid #3f3f46; color: #fff; padding: 5px 12px; border-radius: 6px; font-size: 0.75rem; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 4px; }
     .res-btn:hover { background: #3f3f46; }
     .res-btn.realism { background: rgba(245,158,11,0.15); border-color: rgba(245,158,11,0.4); color: var(--amber); font-weight: 700; }
@@ -619,11 +725,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     .res-btn.cancel { background: #7f1d1d; border-color: #ef4444; color: #fecaca; font-weight: 700; }
     .res-btn.cancel:hover { background: #991b1b; }
 
+    /* Gallery Batch Selection Toolbar */
+    .gallery-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; padding: 8px 12px; background: #1c1c21; border: 1px solid var(--card-border); border-radius: 10px; font-size: 0.78rem; }
+    .gallery-checkbox { width: 16px; height: 16px; accent-color: var(--amber); cursor: pointer; }
+
     /* Side by Side Image Container */
     .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
     @media (max-width: 640px) { .compare-grid { grid-template-columns: 1fr; } }
     .comp-col { display: flex; flex-direction: column; gap: 6px; }
-    .comp-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
+    .comp-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
     .comp-img { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #000; border: 1px solid #27272a; }
     .running-box { width: 100%; min-height: 260px; border-radius: 10px; background: #09090b; border: 2px dashed rgba(245,158,11,0.4); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 1.5rem; text-align: center; }
     .error-box { width: 100%; min-height: 180px; border-radius: 10px; background: #260a0a; border: 1px solid #dc2626; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 1.25rem; text-align: center; }
@@ -637,6 +747,14 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     /* Realism Pass Modal / Inline Panel */
     .realism-panel { background: #09090b; border: 1px solid rgba(245,158,11,0.3); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+
+    /* Full-Screen Compare Modal */
+    .compare-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.88); backdrop-filter: blur(8px); z-index: 1000; display: none; align-items: center; justify-content: center; padding: 1.5rem; }
+    .compare-content { background: #141417; border: 1px solid var(--card-border); border-radius: 14px; width: 100%; max-width: 1300px; max-height: 94vh; overflow-y: auto; padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
+    .compare-cols { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+    @media (max-width: 860px) { .compare-cols { grid-template-columns: 1fr; } }
+    .compare-item { display: flex; flex-direction: column; gap: 8px; background: #09090b; padding: 10px; border-radius: 10px; border: 1px solid #27272a; }
+    .compare-item img { width: 100%; max-height: 60vh; object-fit: contain; border-radius: 8px; background: #000; }
 
     /* Progress Overlay */
     .progress-bar { background: #27272a; border-radius: 6px; overflow: hidden; height: 8px; width: 100%; margin-top: 6px; display: none; }
@@ -656,10 +774,13 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       <div style="display:flex;align-items:center;gap:10px;">
         <span class="status-dot"></span>
         <span style="font-weight:700;">Yanga Studio Lab</span>
-        <span class="badge">Background Worker Engine</span>
+        <span class="badge">Deterministic Background Worker</span>
       </div>
       <div style="display:flex;align-items:center;gap:10px;">
         <div id="topTotalSpend" class="cost-total-badge">Total Spend: $0.000</div>
+        <a id="btnExportTop" href="/api/lab/export?key=${encodeURIComponent(labKey)}" class="res-btn" style="background:rgba(245,158,11,0.15);border-color:var(--amber);color:var(--amber);font-weight:700;">
+          📦 Export All (ZIP)
+        </a>
         <span style="color:var(--text-muted);font-size:0.75rem;">Key Active ✓</span>
       </div>
     </div>
@@ -717,9 +838,9 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       <div style="display:grid;grid-template-columns:1fr 1fr 120px;gap:12px;align-items:end;">
         <!-- Output Size for Kontext Presets -->
         <div>
-          <label>Kontext Output Size</label>
+          <label>Output Framing / Size</label>
           <select id="kontextSizeSelect" onchange="saveCurrentState()">
-            <option value="match_original">Match Original Aspect Ratio (Default)</option>
+            <option value="match_original">Match Original Aspect Ratio (Auto Detect)</option>
             <option value="4:5">4:5 (IG Portrait Feed - 1080x1350)</option>
             <option value="9:16">9:16 (Story / Reel - 1080x1920)</option>
           </select>
@@ -753,99 +874,117 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       
       <div class="presets-grid">
         <!-- Preset A -->
-        <div class="preset-card">
+        <div class="preset-card selected" id="cardPresetA" onclick="toggleCardSelection('A', event)">
           <div class="preset-header">
             <span class="p-tag">Preset A</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.040</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetA" checked onchange="updateSelectedCount()">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetA" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
-          <button type="button" class="preset-btn" id="btnPresetA" onclick="runPreset('A')">
-            <div class="p-title">FLUX.1 Kontext [pro]</div>
-            <div class="p-desc">In-context background & outfit swap. Locks exact face, hair, and pose.</div>
-            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/flux-pro/kontext ↗</div>
-          </button>
+          <div class="p-title">FLUX.1 Kontext [pro]</div>
+          <div class="p-desc">In-context background & outfit swap. Locks exact face, hair, and pose.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">flux-pro/kontext</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyA" onclick="event.stopPropagation(); promptRunOnly('A', 'FLUX.1 Kontext', 0.040);">
+              ⚡ Run only this
+            </button>
+          </div>
         </div>
 
         <!-- Preset B -->
-        <div class="preset-card">
+        <div class="preset-card selected" id="cardPresetB" onclick="toggleCardSelection('B', event)">
           <div class="preset-header">
             <span class="p-tag">Preset B</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.035</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetB" checked onchange="updateSelectedCount()">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetB" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
-          <button type="button" class="preset-btn" id="btnPresetB" onclick="runPreset('B')">
-            <div class="p-title">PuLID Baseline 0.9</div>
-            <div class="p-desc">id_weight 0.9, CFG 1.2, guidance 2.8, start_step 1, 35 steps.</div>
-            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/flux-pulid ↗</div>
-          </button>
+          <div class="p-title">PuLID Baseline 0.9</div>
+          <div class="p-desc">id_weight 0.9, CFG 1.2, guidance 2.8, start_step 1, 35 steps.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">flux-pulid 0.9</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyB" onclick="event.stopPropagation(); promptRunOnly('B', 'PuLID Baseline 0.9', 0.035);">
+              ⚡ Run only this
+            </button>
+          </div>
         </div>
 
         <!-- Preset C -->
-        <div class="preset-card">
+        <div class="preset-card selected" id="cardPresetC" onclick="toggleCardSelection('C', event)">
           <div class="preset-header">
             <span class="p-tag">Preset C</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.035</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetC" checked onchange="updateSelectedCount()">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetC" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
-          <button type="button" class="preset-btn" id="btnPresetC" onclick="runPreset('C')">
-            <div class="p-title">PuLID Natural 0.8</div>
-            <div class="p-desc">id_weight 0.8, CFG 1.0 (pure flow), guidance 2.5, start_step 2, 40 steps.</div>
-            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/flux-pulid ↗</div>
-          </button>
+          <div class="p-title">PuLID Natural 0.8</div>
+          <div class="p-desc">id_weight 0.8, CFG 1.0 (pure flow), guidance 2.5, start_step 2, 40 steps.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">flux-pulid 0.8</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyC" onclick="event.stopPropagation(); promptRunOnly('C', 'PuLID Natural 0.8', 0.035);">
+              ⚡ Run only this
+            </button>
+          </div>
         </div>
 
         <!-- Preset D -->
-        <div class="preset-card">
+        <div class="preset-card selected" id="cardPresetD" onclick="toggleCardSelection('D', event)">
           <div class="preset-header">
             <span class="p-tag">Preset D</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.060</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetD" checked onchange="updateSelectedCount()">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetD" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
-          <button type="button" class="preset-btn" id="btnPresetD" onclick="runPreset('D')">
-            <div class="p-title">Kontext + Upscale + Grain</div>
-            <div class="p-desc">Preset A output &rarr; Clarity Upscaler (creativity 0.2) &rarr; Film Grain (&sigma;&approx;2).</div>
-            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">Multi-Stage Pipeline ↗</div>
-          </button>
+          <div class="p-title">Kontext + Upscale + Grain</div>
+          <div class="p-desc">Preset A output &rarr; Clarity Upscaler (creativity 0.2) &rarr; Film Grain (&sigma;&approx;2).</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">Multi-Stage</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyD" onclick="event.stopPropagation(); promptRunOnly('D', 'Kontext + Upscale + Grain', 0.060);">
+              ⚡ Run only this
+            </button>
+          </div>
         </div>
 
         <!-- Preset E: Nano Banana Edit -->
-        <div class="preset-card">
+        <div class="preset-card selected" id="cardPresetE" onclick="toggleCardSelection('E', event)">
           <div class="preset-header">
             <span class="p-tag">Preset E</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.015</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetE" checked onchange="updateSelectedCount()">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetE" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
-          <button type="button" class="preset-btn" id="btnPresetE" onclick="runPreset('E')">
-            <div class="p-title">Nano Banana Edit</div>
-            <div class="p-desc">Gemini multimodal image editor. Edits background while preserving human subject.</div>
-            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">fal-ai/nano-banana/edit ↗</div>
-          </button>
+          <div class="p-title">Nano Banana Edit</div>
+          <div class="p-desc">Gemini multimodal image editor. Edits background while preserving human subject.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">nano-banana</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyE" onclick="event.stopPropagation(); promptRunOnly('E', 'Nano Banana Edit', 0.015);">
+              ⚡ Run only this
+            </button>
+          </div>
         </div>
 
         <!-- Preset F: Seedream Edit -->
-        <div class="preset-card">
+        <div class="preset-card selected" id="cardPresetF" onclick="toggleCardSelection('F', event)">
           <div class="preset-header">
             <span class="p-tag">Preset F</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.025</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetF" checked onchange="updateSelectedCount()">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetF" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
-          <button type="button" class="preset-btn" id="btnPresetF" onclick="runPreset('F')">
-            <div class="p-title">Seedream Edit</div>
-            <div class="p-desc">ByteDance Seedream image-to-image editor with high compositional accuracy.</div>
-            <div style="font-size:0.72rem;color:var(--amber);margin-top:6px;">bytedance/seedream edit ↗</div>
-          </button>
+          <div class="p-title">Seedream Edit</div>
+          <div class="p-desc">ByteDance Seedream image-to-image editor with high compositional accuracy.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">seedream edit</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyF" onclick="event.stopPropagation(); promptRunOnly('F', 'Seedream Edit', 0.025);">
+              ⚡ Run only this
+            </button>
+          </div>
         </div>
       </div>
 
@@ -897,8 +1036,11 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <span class="num">5</span>
           <span>Results & Side-by-Side Comparison Gallery</span>
         </div>
-        <div style="display:flex;align-items:center;gap:12px;">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
           <span id="gallerySpendTotal" style="font-size:0.75rem;color:#34d399;font-weight:700;">$0.000 spent</span>
+          <button type="button" class="res-btn" id="btnOpenCompare" onclick="openCompareModal()" style="display:none;background:rgba(245,158,11,0.2);border-color:var(--amber);color:var(--amber);font-weight:700;">
+            🔍 Compare 2 Runs (<span id="compareSelectedCount">0</span>)
+          </button>
           <select id="sortSelect" onchange="renderResults(currentResults)" style="padding:4px 8px;font-size:0.75rem;width:auto;">
             <option value="newest">Sort: Newest First</option>
             <option value="rating_desc">Sort: Highest Rated (★)</option>
@@ -908,6 +1050,20 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <span id="resultsCount" style="font-size:0.75rem;color:var(--text-muted);font-weight:normal;">0 runs</span>
         </div>
       </div>
+
+      <!-- Batch Selection & Delete Toolbar -->
+      <div class="gallery-toolbar" id="galleryBatchToolbar" style="display:none;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" id="chkSelectAllGallery" class="gallery-checkbox" onchange="toggleSelectAllGallery(this.checked)">
+          <label for="chkSelectAllGallery" style="cursor:pointer;font-size:0.78rem;color:#fff;margin:0;">Select All Visible Runs</label>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button type="button" class="res-btn delete" id="btnDeleteSelected" onclick="deleteSelectedRuns()">
+            🗑 Delete Selected (<span id="deleteSelectedCount">0</span>)
+          </button>
+        </div>
+      </div>
+
       <div id="resultsGallery" class="results-gallery">
         <div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;">
           No test runs completed yet. Upload a photo and pick a preset above!
@@ -915,6 +1071,19 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       </div>
     </div>
 
+  </div>
+
+  <!-- Fullscreen Comparison Modal -->
+  <div id="compareModal" class="compare-modal">
+    <div class="compare-content">
+      <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #27272a;padding-bottom:10px;">
+        <h3 style="font-size:1rem;font-weight:800;color:var(--amber);">Side-by-Side Dual Run Comparator</h3>
+        <button type="button" class="res-btn" onclick="closeCompareModal()">✕ Close</button>
+      </div>
+      <div id="compareColsContainer" class="compare-cols">
+        <!-- Rendered by JS -->
+      </div>
+    </div>
   </div>
 
   <script>
@@ -928,6 +1097,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     let currentMode = 'scene_only';
     let pollTimer = null;
     let isSequenceRunning = false;
+    let selectedForDelete = new Set();
+    let selectedForCompare = new Set();
 
     async function labFetch(url, options = {}) {
       options.headers = options.headers || {};
@@ -967,6 +1138,47 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       document.getElementById('btnModeSceneOutfit').classList.toggle('active', mode === 'scene_outfit');
       document.getElementById('outfitContainer').style.display = mode === 'scene_outfit' ? 'block' : 'none';
       saveCurrentState();
+    }
+
+    // REQUIREMENT 2: Tapping card toggles checkbox, NEVER runs a model
+    function toggleCardSelection(presetId, event) {
+      const chk = document.getElementById('chkPreset' + presetId);
+      if (chk) {
+        chk.checked = !chk.checked;
+        updateSelectedCount();
+      }
+    }
+
+    function updateSelectedCount() {
+      const all = ['A', 'B', 'C', 'D', 'E', 'F'];
+      let count = 0;
+      all.forEach(p => {
+        const chk = document.getElementById('chkPreset' + p);
+        const card = document.getElementById('cardPreset' + p);
+        if (chk && card) {
+          card.classList.toggle('selected', chk.checked);
+          if (chk.checked) count++;
+        }
+      });
+      document.getElementById('runSelectedLabel').textContent = \`⚡ Run Selected Presets (\${count} of \${all.length} Selected)\`;
+    }
+
+    function toggleAllPresets(checked) {
+      ['A', 'B', 'C', 'D', 'E', 'F'].forEach(p => {
+        const chk = document.getElementById('chkPreset' + p);
+        const card = document.getElementById('cardPreset' + p);
+        if (chk) chk.checked = checked;
+        if (card) card.classList.toggle('selected', checked);
+      });
+      updateSelectedCount();
+    }
+
+    // REQUIREMENT 3: Explicit "Run only this" with cost confirmation
+    function promptRunOnly(preset, name, cost) {
+      const formattedCost = '$' + cost.toFixed(3);
+      if (confirm(\`Run \${name} now? (\${formattedCost})\`)) {
+        runPreset(preset);
+      }
     }
 
     async function loadLabState() {
@@ -1053,7 +1265,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           currentResults = data.results;
           renderResults(currentResults);
           
-          // Check if any jobs are currently active (queued or running)
           const hasActive = currentResults.some(r => r.status === 'queued' || r.status === 'running');
           if (hasActive) {
             startPolling();
@@ -1080,10 +1291,12 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
+    // REQUIREMENT 5: Dimensions & Aspect Ratio Mismatch
     function renderResults(results) {
       const countEl = document.getElementById('resultsCount');
       const gallery = document.getElementById('resultsGallery');
       const sortVal = document.getElementById('sortSelect').value;
+      const toolbar = document.getElementById('galleryBatchToolbar');
 
       const sorted = [...results].sort((a, b) => {
         if (a.status === 'running' || a.status === 'queued') return -1;
@@ -1102,9 +1315,13 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       countEl.textContent = sorted.length + ' run' + (sorted.length === 1 ? '' : 's');
 
       if (!sorted.length) {
+        toolbar.style.display = 'none';
         gallery.innerHTML = '<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.85rem;">No test runs yet. Pick a preset above!</div>';
         return;
       }
+
+      toolbar.style.display = 'flex';
+      updateBatchToolbar();
 
       gallery.innerHTML = sorted.map(r => {
         const origUrl = '/api/lab/original?key=' + encodeURIComponent(LAB_KEY);
@@ -1115,13 +1332,27 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         const costBadge = r.cost != null ? \`<span class="res-cost">💰 $\${parseFloat(r.cost).toFixed(3)}</span>\` : '';
         const parentBadge = r.parentRunId ? \`<span class="res-badge" style="background:rgba(59,130,246,0.15);color:#60a5fa;">🔗 Linked to #\${r.parentRunId}</span>\` : '';
 
-        // Status Card 1: QUEUED OR RUNNING CARD
+        // Dimensions badge & aspect mismatch warning
+        let dimsBadge = '';
+        if (r.dimensions && r.dimensions.width && r.dimensions.height) {
+          dimsBadge = \`<span class="res-dims">\${r.dimensions.width} &times; \${r.dimensions.height}</span>\`;
+        }
+        let mismatchPill = '';
+        if (r.aspectMismatch) {
+          mismatchPill = \`<span class="mismatch-badge">⚠️ Aspect Ratio Differs from Original</span>\`;
+        }
+
+        const isChecked = selectedForDelete.has(r.id);
+        const isCompared = selectedForCompare.has(r.id);
+
+        // 1. QUEUED / RUNNING CARD
         if (r.status === 'queued' || r.status === 'running') {
           const statusText = r.status === 'queued' ? '⏳ Queued in Worker...' : '⚡ Running on Fal GPU...';
           return \`
             <div class="result-card running" id="card-\${r.id}">
               <div class="res-header">
                 <div class="res-meta">
+                  <input type="checkbox" class="gallery-checkbox" \${isChecked ? 'checked' : ''} onchange="toggleSelectRun('\${r.id}', this.checked)">
                   <span class="res-badge" style="background:#f59e0b;color:#000;font-weight:800;">\${statusText}</span>
                   <span class="res-badge">\${r.presetLabel || r.preset || 'Run'}</span>
                   <span class="res-model">\${r.model}</span>
@@ -1129,6 +1360,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
                 </div>
                 <div class="res-actions">
                   <button type="button" class="res-btn cancel" onclick="cancelRun('\${r.id}')">🚫 Cancel Job</button>
+                  <button type="button" class="res-btn delete" onclick="deleteRun('\${r.id}')">🗑 Delete</button>
                 </div>
               </div>
               <div class="compare-grid">
@@ -1149,7 +1381,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           \`;
         }
 
-        // Status Card 2: ERROR, INTERRUPTED, OR CANCELED CARD
+        // 2. ERROR / INTERRUPTED / CANCELED CARD
         if (r.status === 'error' || r.status === 'interrupted' || r.status === 'canceled') {
           const badgeClass = r.status === 'error' ? 'background:#ef4444;color:#fff;' : 'background:#f59e0b;color:#000;';
           const label = r.status === 'error' ? '❌ Failed' : (r.status === 'interrupted' ? '⚠️ Interrupted' : '🚫 Canceled');
@@ -1157,6 +1389,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
             <div class="result-card failed" id="card-\${r.id}">
               <div class="res-header">
                 <div class="res-meta">
+                  <input type="checkbox" class="gallery-checkbox" \${isChecked ? 'checked' : ''} onchange="toggleSelectRun('\${r.id}', this.checked)">
                   <span class="res-badge" style="\${badgeClass}font-weight:800;">\${label}</span>
                   <span class="res-badge">\${r.presetLabel || r.preset || 'Run'}</span>
                   <span class="res-model">\${r.model}</span>
@@ -1174,7 +1407,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
                 <div class="comp-col">
                   <span class="comp-label">Failure Diagnostic</span>
                   <div class="error-box">
-                    <div style="font-weight:700;color:#fca5a5;font-size:0.85rem;">Run Terminated with Error:</div>
+                    <div style="font-weight:700;color:#fca5a5;font-size:0.85rem;">Run Terminated:</div>
                     <div style="font-family:monospace;font-size:0.75rem;color:#fecaca;max-height:160px;overflow-y:auto;text-align:left;background:#180606;padding:8px;border-radius:6px;width:100%;box-sizing:border-box;">
                       \${r.error || 'Unknown error occurred'}
                     </div>
@@ -1185,7 +1418,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           \`;
         }
 
-        // Status Card 3: COMPLETED SUCCESSFUL RUN (status === 'done')
+        // 3. COMPLETED RUN (status === 'done')
         let starsHtml = '';
         for (let s = 1; s <= 5; s++) {
           starsHtml += \`<button type="button" class="star-btn \${s <= rating ? 'active' : ''}" onclick="saveRating('\${r.id}', \${s})">★</button>\`;
@@ -1195,15 +1428,21 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="result-card" id="card-\${r.id}">
             <div class="res-header">
               <div class="res-meta">
+                <input type="checkbox" class="gallery-checkbox" \${isChecked ? 'checked' : ''} onchange="toggleSelectRun('\${r.id}', this.checked)">
                 <span class="res-badge">\${r.presetLabel || r.preset || 'Run'}</span>
                 \${parentBadge}
                 <span class="res-model">\${r.model}</span>
                 <span>Seed: <strong>\${r.seed ?? 'N/A'}</strong></span>
                 <span class="res-runtime">⚡ \${r.runtime || 'N/A'}</span>
+                \${dimsBadge}
+                \${mismatchPill}
                 \${costBadge}
                 <span style="color:var(--text-muted);">\${new Date(r.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
               </div>
               <div class="res-actions">
+                <button type="button" class="res-btn" style="\${isCompared ? 'background:var(--amber);color:#000;font-weight:700;' : ''}" onclick="toggleCompareRun('\${r.id}')">
+                  \${isCompared ? '✓ Comparing' : '🔍 Compare'}
+                </button>
                 <button type="button" class="res-btn realism" onclick="toggleRealismPanel('\${r.id}')">✨ Realism Pass</button>
                 <a href="\${genUrl}" download="\${r.id}.jpg" target="_blank" class="res-btn">⬇ Download</a>
                 <button type="button" class="res-btn delete" onclick="deleteRun('\${r.id}')">🗑 Delete</button>
@@ -1224,11 +1463,17 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
             <div class="compare-grid">
               <div class="comp-col">
-                <span class="comp-label">Original Reference</span>
+                <div class="comp-label">
+                  <span>Original Reference</span>
+                  <span style="color:var(--text-muted);font-size:0.7rem;">\${r.origDimensions ? (r.origDimensions.width + ' &times; ' + r.origDimensions.height) : ''}</span>
+                </div>
                 <img src="\${origUrl}" class="comp-img" alt="Original Reference" />
               </div>
               <div class="comp-col">
-                <span class="comp-label">Generated Result (\${r.presetLabel || r.preset || 'Output'})</span>
+                <div class="comp-label">
+                  <span>Generated Result (\${r.presetLabel || r.preset || 'Output'})</span>
+                  <span style="color:var(--text-muted);font-size:0.7rem;">\${r.dimensions ? (r.dimensions.width + ' &times; ' + r.dimensions.height) : ''}</span>
+                </div>
                 <img src="\${genUrl}" class="comp-img" alt="Generated Result" onclick="window.open('\${genUrl}', '_blank')" style="cursor:zoom-in;" />
               </div>
             </div>
@@ -1248,6 +1493,151 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           </div>
         \`;
       }).join('');
+    }
+
+    // REQUIREMENT 1: Safe deletion with confirmation & server confirmation
+    async function deleteRun(id) {
+      if (!confirm('Are you sure you want to permanently delete this test run and all its images from disk?')) {
+        return;
+      }
+      showError(null);
+      try {
+        const res = await labFetch('/api/lab/run/' + encodeURIComponent(id), { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+          selectedForDelete.delete(id);
+          selectedForCompare.delete(id);
+          currentResults = currentResults.filter(r => r.id !== id);
+          renderResults(currentResults);
+        } else {
+          showError('Delete failed: ' + (data.error || 'Server rejected deletion'));
+        }
+      } catch (err) {
+        showError('Delete failed: ' + err.message);
+      }
+    }
+
+    // REQUIREMENT 8: Batch selection & Delete selected
+    function toggleSelectRun(id, checked) {
+      if (checked) selectedForDelete.add(id);
+      else selectedForDelete.delete(id);
+      updateBatchToolbar();
+    }
+
+    function toggleSelectAllGallery(checked) {
+      currentResults.forEach(r => {
+        if (checked) selectedForDelete.add(r.id);
+        else selectedForDelete.delete(r.id);
+      });
+      renderResults(currentResults);
+    }
+
+    function updateBatchToolbar() {
+      const count = selectedForDelete.size;
+      document.getElementById('deleteSelectedCount').textContent = count;
+      document.getElementById('btnDeleteSelected').disabled = count === 0;
+      document.getElementById('chkSelectAllGallery').checked = count === currentResults.length && currentResults.length > 0;
+    }
+
+    async function deleteSelectedRuns() {
+      const ids = Array.from(selectedForDelete);
+      if (!ids.length) return;
+      if (!confirm(\`Permanently delete \${ids.length} selected runs and their image files from disk?\`)) {
+        return;
+      }
+      showError(null);
+      try {
+        const res = await labFetch('/api/lab/results/batch-delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        const data = await res.json();
+        if (data.success) {
+          ids.forEach(id => {
+            selectedForDelete.delete(id);
+            selectedForCompare.delete(id);
+          });
+          currentResults = currentResults.filter(r => !ids.includes(r.id));
+          renderResults(currentResults);
+        } else {
+          showError('Batch delete failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (err) {
+        showError('Batch delete failed: ' + err.message);
+      }
+    }
+
+    // REQUIREMENT 7: Compare Mode
+    function toggleCompareRun(id) {
+      if (selectedForCompare.has(id)) {
+        selectedForCompare.delete(id);
+      } else {
+        if (selectedForCompare.size >= 2) {
+          const first = Array.from(selectedForCompare)[0];
+          selectedForCompare.delete(first);
+        }
+        selectedForCompare.add(id);
+      }
+
+      const count = selectedForCompare.size;
+      const btn = document.getElementById('btnOpenCompare');
+      document.getElementById('compareSelectedCount').textContent = count;
+      btn.style.display = count > 0 ? 'inline-flex' : 'none';
+
+      if (count === 2) {
+        openCompareModal();
+      }
+      renderResults(currentResults);
+    }
+
+    function openCompareModal() {
+      const ids = Array.from(selectedForCompare);
+      if (ids.length < 2) {
+        alert('Please select at least 2 runs using the 🔍 Compare button on each card.');
+        return;
+      }
+
+      const r1 = currentResults.find(r => r.id === ids[0]);
+      const r2 = currentResults.find(r => r.id === ids[1]);
+      if (!r1 || !r2) return;
+
+      const origUrl = '/api/lab/original?key=' + encodeURIComponent(LAB_KEY);
+      const url1 = r1.imageUrl ? (r1.imageUrl.startsWith('http') ? r1.imageUrl : r1.imageUrl + '?key=' + encodeURIComponent(LAB_KEY)) : r1.remoteUrl;
+      const url2 = r2.imageUrl ? (r2.imageUrl.startsWith('http') ? r2.imageUrl : r2.imageUrl + '?key=' + encodeURIComponent(LAB_KEY)) : r2.remoteUrl;
+
+      const container = document.getElementById('compareColsContainer');
+      container.innerHTML = \`
+        <div class="compare-item">
+          <div style="font-size:0.8rem;font-weight:700;color:var(--amber);">ORIGINAL REFERENCE</div>
+          <img src="\${origUrl}" alt="Original" />
+          <div style="font-size:0.75rem;color:var(--text-muted);margin-top:auto;">Pixel Dimensions: \${r1.origDimensions ? (r1.origDimensions.width + ' x ' + r1.origDimensions.height) : 'Native'}</div>
+        </div>
+        <div class="compare-item">
+          <div style="font-size:0.8rem;font-weight:700;color:#fff;">\${r1.presetLabel || r1.preset}</div>
+          <img src="\${url1}" alt="Run 1" onclick="window.open('\${url1}','_blank')" style="cursor:zoom-in;" />
+          <div style="font-size:0.75rem;color:var(--text-muted);margin-top:auto;">
+            <div>Model: \${r1.model}</div>
+            <div>Dims: \${r1.dimensions ? (r1.dimensions.width + ' x ' + r1.dimensions.height) : 'N/A'}</div>
+            <div>Rating: \${r1.rating ? '★'.repeat(r1.rating) : 'Unrated'}</div>
+          </div>
+        </div>
+        <div class="compare-item">
+          <div style="font-size:0.8rem;font-weight:700;color:#fff;">\${r2.presetLabel || r2.preset}</div>
+          <img src="\${url2}" alt="Run 2" onclick="window.open('\${url2}','_blank')" style="cursor:zoom-in;" />
+          <div style="font-size:0.75rem;color:var(--text-muted);margin-top:auto;">
+            <div>Model: \${r2.model}</div>
+            <div>Dims: \${r2.dimensions ? (r2.dimensions.width + ' x ' + r2.dimensions.height) : 'N/A'}</div>
+            <div>Rating: \${r2.rating ? '★'.repeat(r2.rating) : 'Unrated'}</div>
+          </div>
+        </div>
+      \`;
+
+      document.getElementById('compareModal').style.display = 'flex';
+    }
+
+    function closeCompareModal() {
+      document.getElementById('compareModal').style.display = 'none';
     }
 
     async function cancelRun(id) {
@@ -1324,36 +1714,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    async function deleteRun(id) {
-      if (!confirm('Delete this test run?')) return;
-      try {
-        const res = await labFetch('/api/lab/results/' + encodeURIComponent(id), { method: 'DELETE' });
-        const data = await res.json();
-        if (data.success) {
-          currentResults = currentResults.filter(r => r.id !== id);
-          renderResults(currentResults);
-        } else {
-          alert('Delete failed: ' + (data.error || 'Unknown error'));
-        }
-      } catch (err) {
-        alert('Delete failed: ' + err.message);
-      }
-    }
-
-    function updateSelectedCount() {
-      const all = ['A', 'B', 'C', 'D', 'E', 'F'];
-      const selected = all.filter(p => document.getElementById('chkPreset' + p)?.checked);
-      document.getElementById('runSelectedLabel').textContent = \`⚡ Run Selected Presets (\${selected.length} of \${all.length} Selected)\`;
-    }
-
-    function toggleAllPresets(checked) {
-      ['A', 'B', 'C', 'D', 'E', 'F'].forEach(p => {
-        const chk = document.getElementById('chkPreset' + p);
-        if (chk) chk.checked = checked;
-      });
-      updateSelectedCount();
-    }
-
     async function submitRun(preset, customConfig = null) {
       showError(null);
       const scene = document.getElementById('sceneInput').value;
@@ -1374,16 +1734,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
 
     function setButtonsDisabled(disabled) {
-      document.querySelectorAll('.preset-btn, #btnRunSelected, #btnRunCustom').forEach(b => b.disabled = disabled);
+      document.querySelectorAll('.btn-run-all, #btnRunCustom, .run-only-btn').forEach(b => b.disabled = disabled);
     }
 
-    // Run single preset as background job
     async function runPreset(preset) {
       setButtonsDisabled(true);
       showError(null);
 
       try {
-        const data = await submitRun(preset);
+        await submitRun(preset);
         await loadResults();
         startPolling();
       } catch (err) {
@@ -1413,7 +1772,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
-    // Helper: Poll single run until finished (max 185s)
     function pollRunUntilDone(runId, maxWaitMs = 185000) {
       return new Promise((resolve) => {
         const startTime = Date.now();
@@ -1439,7 +1797,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       });
     }
 
-    // Run All / Selected sequentially with timeout & fault tolerance
     async function runSelectedSequential() {
       const allPresets = [
         { id: 'A', name: 'Preset A (Flux-Pro Kontext)' },
@@ -1478,12 +1835,9 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           const runData = await submitRun(item.id);
           const runId = runData.runId;
           await loadResults();
-          
-          // Poll until this preset completes or errors (180s timeout enforced by backend)
           await pollRunUntilDone(runId, 185000);
           await loadResults();
         } catch (err) {
-          // Requirement 4: Continue after any failed preset and show full error card
           console.warn(\`Preset \${item.name} failed:\`, err.message);
           await loadResults();
         }
@@ -1654,7 +2008,6 @@ router.get('/api/lab/results', labAuthMiddleware, (req, res) => {
 
 /**
  * GET /api/lab/run/:id/status
- * Polled by frontend every 3 seconds for active runs
  */
 router.get('/api/lab/run/:id/status', labAuthMiddleware, (req, res) => {
   try {
@@ -1671,7 +2024,6 @@ router.get('/api/lab/run/:id/status', labAuthMiddleware, (req, res) => {
 
 /**
  * POST /api/lab/run/:id/cancel
- * Cancel an active or queued background job
  */
 router.post('/api/lab/run/:id/cancel', labAuthMiddleware, (req, res) => {
   try {
@@ -1690,6 +2042,45 @@ router.post('/api/lab/run/:id/cancel', labAuthMiddleware, (req, res) => {
 
     console.log(`[LAB] Run ${id} canceled.`);
     res.json({ success: true, result: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/lab/run/:id and DELETE /api/lab/results/:id
+ * REQUIREMENT 1: Safe deletion that cancels active job, skips worker writes, and removes files
+ */
+const handleDeleteRun = (req, res) => {
+  try {
+    const id = req.params.id;
+    deleteRunFromDisk(id);
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('[LAB DELETE ERROR]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+};
+router.delete('/api/lab/run/:id', labAuthMiddleware, handleDeleteRun);
+router.delete('/api/lab/results/:id', labAuthMiddleware, handleDeleteRun);
+
+/**
+ * POST /api/lab/results/batch-delete
+ * REQUIREMENT 8: Delete multiple runs at once
+ */
+router.post('/api/lab/results/batch-delete', labAuthMiddleware, (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || !ids.length) {
+      return res.status(400).json({ success: false, error: 'No IDs provided for deletion.' });
+    }
+
+    let deletedCount = 0;
+    for (const id of ids) {
+      if (deleteRunFromDisk(id)) deletedCount++;
+    }
+
+    res.json({ success: true, deletedCount });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1718,7 +2109,6 @@ router.post('/api/lab/results/:id/update', labAuthMiddleware, (req, res) => {
 
 /**
  * POST /api/lab/realism-pass
- * Sharp-only finishing (grain sigma 1.5-2.5, slight contrast lift, no upscaler)
  */
 router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
   try {
@@ -1739,6 +2129,8 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
       .toBuffer();
 
     const grainBuffer = await applySharpFilmGrain(contrastLifted, parseFloat(sigma));
+    const genMeta = await sharp(grainBuffer).metadata();
+    const origMeta = await getOriginalPhotoMetadata();
 
     const runId = `run_${Date.now()}`;
     const localFileName = `${runId}.jpg`;
@@ -1763,6 +2155,9 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
       cost: 0.000,
       timestamp: new Date().toISOString(),
       imageUrl: `/api/lab/results/${localFileName}`,
+      dimensions: { width: genMeta.width || 0, height: genMeta.height || 0 },
+      origDimensions: { width: origMeta.width, height: origMeta.height },
+      aspectMismatch: Math.abs((genMeta.width / genMeta.height) - origMeta.ratio) > 0.08,
       rating: 0,
       notes: `Realism pass applied to run ${parentRunId}`
     };
@@ -1771,6 +2166,139 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
     res.json({ success: true, result: newRecord });
   } catch (err) {
     console.error('[LAB REALISM PASS ERROR]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/lab/export
+ * REQUIREMENT 6: Export all runs, images, original photo, report.csv, and report.html in a streamed zip
+ */
+router.get('/api/lab/export', labAuthMiddleware, async (req, res) => {
+  try {
+    const files = fs.readdirSync(RESULTS_DIR).filter(f => f.endsWith('.json'));
+    const runs = files.map(f => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, f), 'utf8'));
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+
+    // Sort by rating descending, then newest
+    runs.sort((a, b) => ((b.rating || 0) - (a.rating || 0)) || (new Date(b.timestamp) - new Date(a.timestamp)));
+
+    // Generate CSV
+    const csvRows = [
+      ['Run ID', 'Status', 'Preset', 'Model', 'Seed', 'Rating', 'Cost ($)', 'Runtime', 'Dimensions', 'Aspect Mismatch', 'Scene Description', 'Outfit', 'Notes', 'Timestamp']
+    ];
+
+    runs.forEach(r => {
+      csvRows.push([
+        r.id,
+        r.status || 'done',
+        r.presetLabel || r.preset || '',
+        r.model || '',
+        r.seed ?? '',
+        r.rating || 0,
+        r.cost != null ? parseFloat(r.cost).toFixed(3) : '',
+        r.runtime || '',
+        r.dimensions ? `${r.dimensions.width}x${r.dimensions.height}` : '',
+        r.aspectMismatch ? 'YES' : 'NO',
+        r.params?.scene || '',
+        r.params?.outfit || '',
+        (r.notes || '').replace(/"/g, '""'),
+        r.timestamp || ''
+      ]);
+    });
+
+    const csvContent = csvRows.map(row => row.map(val => `"${String(val).replace(/"/g, '""')}"`).join(',')).join('\n');
+
+    // Generate HTML Report
+    const htmlReport = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Yanga Studio Lab — Experiment Report</title>
+  <style>
+    body { background: #09090b; color: #fafafa; font-family: system-ui, sans-serif; padding: 2rem; margin: 0; }
+    h1 { color: #f59e0b; margin-bottom: 0.5rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; font-size: 0.85rem; }
+    th, td { border: 1px solid #27272a; padding: 10px; text-align: left; }
+    th { background: #141417; color: #f59e0b; }
+    tr:nth-child(even) { background: #141417; }
+    .star { color: #f59e0b; }
+    img.thumb { width: 80px; height: 100px; object-fit: cover; border-radius: 6px; border: 1px solid #3f3f46; }
+  </style>
+</head>
+<body>
+  <h1>Yanga Studio — Realism Lab Evaluation Report</h1>
+  <p style="color:#a1a1aa;font-size:0.9rem;">Exported ${new Date().toLocaleString()} • Total Runs: ${runs.length} • Total Spend: $${runs.reduce((s, r) => s + (parseFloat(r.cost) || 0), 0).toFixed(3)}</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Output</th>
+        <th>Run ID</th>
+        <th>Preset</th>
+        <th>Model</th>
+        <th>Rating</th>
+        <th>Dimensions</th>
+        <th>Cost</th>
+        <th>Runtime</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${runs.map(r => `
+        <tr>
+          <td>${r.imageUrl ? `<img src="runs/${path.basename(r.imageUrl)}" class="thumb" alt="${r.id}">` : 'N/A'}</td>
+          <td><code>${r.id}</code></td>
+          <td><strong>${r.presetLabel || r.preset}</strong></td>
+          <td><code>${r.model}</code></td>
+          <td><span class="star">${r.rating ? '★'.repeat(r.rating) : 'Unrated'}</span></td>
+          <td>${r.dimensions ? `${r.dimensions.width}&times;${r.dimensions.height} px` : 'N/A'}</td>
+          <td style="color:#34d399;">$${parseFloat(r.cost || 0).toFixed(3)}</td>
+          <td>${r.runtime || 'N/A'}</td>
+          <td>${r.notes || '—'}</td>
+        </tr>
+      `).join('')}
+    </tbody>
+  </table>
+</body>
+</html>`;
+
+    const zipFilename = `yanga_lab_export_${Date.now()}.zip`;
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipFilename}"`);
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.pipe(res);
+
+    if (fs.existsSync(ORIGINAL_PHOTO_PATH)) {
+      archive.file(ORIGINAL_PHOTO_PATH, { name: 'original.jpg' });
+    }
+    archive.append(csvContent, { name: 'report.csv' });
+    archive.append(htmlReport, { name: 'report.html' });
+
+    // Append all runs
+    for (const r of runs) {
+      const jsonFile = path.join(RESULTS_DIR, `${r.id}.json`);
+      if (fs.existsSync(jsonFile)) {
+        archive.file(jsonFile, { name: `runs/${r.id}.json` });
+      }
+      const jpgFile = path.join(RESULTS_DIR, `${r.id}.jpg`);
+      if (fs.existsSync(jpgFile)) {
+        archive.file(jpgFile, { name: `runs/${r.id}.jpg` });
+      }
+      const pngFile = path.join(RESULTS_DIR, `${r.id}.png`);
+      if (fs.existsSync(pngFile)) {
+        archive.file(pngFile, { name: `runs/${r.id}.png` });
+      }
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error('[LAB EXPORT ERROR]:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -1795,39 +2323,11 @@ router.get('/api/lab/results/:filename', labAuthMiddleware, (req, res) => {
 });
 
 /**
- * DELETE /api/lab/results/:id
- */
-router.delete('/api/lab/results/:id', labAuthMiddleware, (req, res) => {
-  try {
-    const id = req.params.id;
-    const job = activeJobs.get(id);
-    if (job) {
-      job.isCanceled = true;
-      if (job.timeoutId) clearTimeout(job.timeoutId);
-      activeJobs.delete(id);
-    }
-
-    const jsonPath = path.join(RESULTS_DIR, `${id}.json`);
-    const imgJpg = path.join(RESULTS_DIR, `${id}.jpg`);
-    const imgPng = path.join(RESULTS_DIR, `${id}.png`);
-
-    if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath);
-    if (fs.existsSync(imgJpg)) fs.unlinkSync(imgJpg);
-    if (fs.existsSync(imgPng)) fs.unlinkSync(imgPng);
-
-    console.log('[LAB] Deleted run:', id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/**
  * POST /api/lab/run
- * Non-blocking: creates run record, returns runId immediately with status "queued",
- * and processes job asynchronously in detached worker.
+ * Non-blocking: deduplicates within 10s, creates run record, returns runId immediately,
+ * and executes in background worker.
  */
-router.post('/api/lab/run', labAuthMiddleware, (req, res) => {
+router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
   if (!fs.existsSync(ORIGINAL_PHOTO_PATH)) {
     return res.status(400).json({
       success: false,
@@ -1845,6 +2345,19 @@ router.post('/api/lab/run', labAuthMiddleware, (req, res) => {
 
   const { preset, mode, scene, outfit, outputSize, seed, customConfig } = req.body;
   const numSeed = parseInt(seed, 10) || 42;
+
+  // REQUIREMENT 4: Deduplication: Ignore identical request within 10 seconds
+  const dedupKey = `${preset}_${numSeed}_${(scene || '').trim()}_${(outfit || '').trim()}_${mode}_${outputSize}`;
+  const lastSubmittedTime = recentRunRequests.get(dedupKey);
+  if (lastSubmittedTime && (Date.now() - lastSubmittedTime < 10000)) {
+    console.warn(`[LAB DEDUP] Ignored duplicate run request for ${preset} (submitted ${Date.now() - lastSubmittedTime}ms ago)`);
+    return res.status(429).json({
+      success: false,
+      error: 'Duplicate request ignored. An identical run was submitted less than 10 seconds ago.'
+    });
+  }
+  recentRunRequests.set(dedupKey, Date.now());
+
   const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
   let presetLabel = `Preset ${preset}`;
@@ -1855,6 +2368,8 @@ router.post('/api/lab/run', labAuthMiddleware, (req, res) => {
   else if (preset === 'E') presetLabel = 'Preset E (Nano Banana Edit)';
   else if (preset === 'F') presetLabel = 'Preset F (Seedream Edit)';
   else if (preset === 'custom') presetLabel = 'Custom Run';
+
+  const origMeta = await getOriginalPhotoMetadata();
 
   const initialRecord = {
     id: runId,
@@ -1873,6 +2388,9 @@ router.post('/api/lab/run', labAuthMiddleware, (req, res) => {
     timestamp: new Date().toISOString(),
     imageUrl: null,
     remoteUrl: null,
+    dimensions: null,
+    origDimensions: { width: origMeta.width, height: origMeta.height },
+    aspectMismatch: false,
     hasOriginal: true,
     rating: 0,
     notes: ''
@@ -1880,7 +2398,7 @@ router.post('/api/lab/run', labAuthMiddleware, (req, res) => {
 
   fs.writeFileSync(path.join(RESULTS_DIR, `${runId}.json`), JSON.stringify(initialRecord, null, 2), 'utf8');
 
-  // Immediately respond with queued status and runId
+  // Immediately respond with queued status
   res.json({
     success: true,
     runId,
