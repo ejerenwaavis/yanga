@@ -3,6 +3,7 @@ import multer from 'multer';
 import sharp from 'sharp';
 import path from 'path';
 import fs from 'fs';
+import archiver from 'archiver';
 import { fileURLToPath } from 'url';
 import { fal } from '@fal-ai/client';
 import { 
@@ -20,32 +21,45 @@ const router = express.Router();
 // Default to 'v2'. Set PIPELINE=legacy in .env to roll back to old PuLID flow.
 const PIPELINE = process.env.PIPELINE || 'v2';
 
-// Local storage for temporary generations (kept outside public_html, pruned after 24h)
-const GENERATIONS_DIR = path.join(__dirname, '..', 'storage', 'generations');
+// Local storage for temporary generations & originals (pruned after 7 days)
+const STORAGE_DIR = path.join(__dirname, '..', 'storage');
+const GENERATIONS_DIR = path.join(STORAGE_DIR, 'generations');
+const ORIGINALS_DIR = path.join(STORAGE_DIR, 'originals');
+
 if (!fs.existsSync(GENERATIONS_DIR)) {
   fs.mkdirSync(GENERATIONS_DIR, { recursive: true });
 }
+if (!fs.existsSync(ORIGINALS_DIR)) {
+  fs.mkdirSync(ORIGINALS_DIR, { recursive: true });
+}
 
-// ─── 24-HOUR FILE CLEANUP ─────────────────────────────────────────────────────
+// ─── 7-DAY RETENTION FILE CLEANUP (ORIGINALS & OUTPUTS) ───────────────────────
 function cleanupOldGenerations() {
   try {
-    if (!fs.existsSync(GENERATIONS_DIR)) return;
     const now = Date.now();
-    const maxAgeMs = 24 * 60 * 60 * 1000; // 24 hours
-    const files = fs.readdirSync(GENERATIONS_DIR);
-    let deletedCount = 0;
-    for (const file of files) {
-      const filePath = path.join(GENERATIONS_DIR, file);
-      try {
-        const stat = fs.statSync(filePath);
-        if (now - stat.mtimeMs > maxAgeMs) {
-          fs.unlinkSync(filePath);
-          deletedCount++;
-        }
-      } catch {}
-    }
-    if (deletedCount > 0) {
-      console.log(`[CLEANUP] Purged ${deletedCount} production generation files older than 24h.`);
+    const maxAgeMs = 7 * 24 * 60 * 60 * 1000; // 7 days (updated from 24h)
+
+    const cleanDir = (dir) => {
+      if (!fs.existsSync(dir)) return 0;
+      const files = fs.readdirSync(dir);
+      let count = 0;
+      for (const file of files) {
+        const filePath = path.join(dir, file);
+        try {
+          const stat = fs.statSync(filePath);
+          if (now - stat.mtimeMs > maxAgeMs) {
+            fs.unlinkSync(filePath);
+            count++;
+          }
+        } catch {}
+      }
+      return count;
+    };
+
+    const genPurged = cleanDir(GENERATIONS_DIR);
+    const origPurged = cleanDir(ORIGINALS_DIR);
+    if (genPurged > 0 || origPurged > 0) {
+      console.log(`[CLEANUP] Purged ${genPurged} generations and ${origPurged} originals older than 7 days.`);
     }
   } catch (err) {
     console.warn('[CLEANUP WARNING]:', err.message);
@@ -139,6 +153,22 @@ export function buildV2Prompt(instruction, locks = {}) {
   return `Edit this photo: ${cleanInstruction}. Keep the person's face, skin tone, facial features, expression and body proportions exactly identical to the photo${locksPart}. If my request conflicts with a keep rule, follow my request. No readable text, signs or logos in the background. Clean sky with no stray shapes. Natural unretouched photo.`;
 }
 
+export function generatePhotoFilename(sceneOrInstruction, version = 1) {
+  let slug = 'photo';
+  if (sceneOrInstruction) {
+    slug = sceneOrInstruction
+      .toLowerCase()
+      .replace(/^place me (in|on|at|along)\s+/i, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 30)
+      .replace(/-+$/, '');
+  }
+  if (!slug) slug = 'photo';
+  const timestamp = Date.now();
+  return `${slug}-${timestamp}-v${version}.jpg`;
+}
+
 // ─── LEGACY PULID CONSTANTS ──────────────────────────────────────────────────
 const LEGACY_REALISM_SUFFIX = "Shot on Canon EOS R5 with 85mm f/1.4L lens, raw unretouched editorial photography, authentic natural skin texture with visible pores and subtle skin micro-details, natural subsurface scattering, true-to-life dynamic range, natural shadow falloff, subtle Kodak Portra 400 film grain, zero airbrushing.";
 const LEGACY_NEGATIVE_PROMPT = "plastic skin, airbrushed, cartoon, CGI, 3D render, oversaturated, deformed face, bad anatomy, blur, bad eyes, extra limbs";
@@ -158,10 +188,21 @@ function mapLegacyAspectRatio(ratioKey) {
 
 // ─── PIPELINE V2 WORKER (Nano Banana Edit -> SeedVR2 2x Upscale) ─────────────
 async function runPipelineV2Worker(jobId, jobParams) {
-  const { fileBuffer, instruction, locks, userId } = jobParams;
+  const { 
+    fileBuffer, 
+    instruction, 
+    locks, 
+    userId, 
+    parentId, 
+    baseUsed, 
+    version, 
+    sceneSlug, 
+    originalFileName, 
+    originalUrl 
+  } = jobParams;
   const startTime = Date.now();
 
-  console.log(`[PIPELINE V2] Starting background worker for job ${jobId}...`);
+  console.log(`[PIPELINE V2] Starting background worker for job ${jobId} (v${version || 1}, base: ${baseUsed || 'original'})...`);
   updateJobRecord(jobId, { status: 'running', stage: 'initializing' });
 
   // 180s Timeout Guard
@@ -185,8 +226,8 @@ async function runPipelineV2Worker(jobId, jobParams) {
     }
     fal.config({ credentials: falKey });
 
-    // STEP 1: Resize photo with sharp to max 2048px on the long side while preserving ratio
-    console.log(`[PIPELINE V2] Resizing reference photo with sharp (max 2048px)...`);
+    // STEP 1: Downscale input photo with sharp to max 2048px on the long side while preserving ratio
+    console.log(`[PIPELINE V2] Downscaling input photo with sharp (max 2048px)...`);
     const resizedBuffer = await sharp(fileBuffer)
       .resize({
         width: 2048,
@@ -202,14 +243,16 @@ async function runPipelineV2Worker(jobId, jobParams) {
     const origH = resizedMeta.height;
 
     // Upload to Fal CDN
-    console.log(`[PIPELINE V2] Uploading resized reference to Fal storage (${origW}x${origH})...`);
+    console.log(`[PIPELINE V2] Uploading resized input to Fal storage (${origW}x${origH})...`);
     const photoBlob = new Blob([resizedBuffer], { type: 'image/jpeg' });
     const uploadedUrl = await fal.storage.upload(photoBlob);
 
-    // Backup reference to Cloudinary in background for user history
-    uploadReferenceImage(resizedBuffer, 'image/jpeg', { userId }).catch((e) =>
-      console.warn('[CLOUDINARY NOTICE] Reference upload skipped:', e.message)
-    );
+    // Backup reference to Cloudinary in background for user history (if fresh upload)
+    if (!parentId) {
+      uploadReferenceImage(resizedBuffer, 'image/jpeg', { userId }).catch((e) =>
+        console.warn('[CLOUDINARY NOTICE] Reference upload skipped:', e.message)
+      );
+    }
 
     // STEP 2: Build Canonical V2 Prompt & Run fal-ai/nano-banana/edit
     updateJobRecord(jobId, { stage: 'editing_background' });
@@ -277,15 +320,17 @@ async function runPipelineV2Worker(jobId, jobParams) {
     const finalW = finalMeta.width || (isUpscaled ? origW * 2 : origW);
     const finalH = finalMeta.height || (isUpscaled ? origH * 2 : origH);
 
-    // Save temporary copy for 24h caching
-    const localFileName = `${jobId}.jpg`;
-    fs.writeFileSync(path.join(GENERATIONS_DIR, localFileName), finalBuffer);
+    // Save image locally with standard filename format: {scene-slug}-{timestamp}-v{n}.jpg
+    const finalFileName = generatePhotoFilename(sceneSlug || instruction, version || 1);
+    fs.writeFileSync(path.join(GENERATIONS_DIR, finalFileName), finalBuffer);
+    // Keep jobId.jpg alias for backward-compatible lookups
+    fs.writeFileSync(path.join(GENERATIONS_DIR, `${jobId}.jpg`), finalBuffer);
 
     // Cost & Runtime Logging
     const totalCost = editCost + upscaleCost;
     const runtimeMs = Date.now() - startTime;
     const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
-    console.log(`[GENERATE COST] Job ${jobId} finished in ${runtimeStr}. Total: $${totalCost.toFixed(3)} (nano-banana: $${editCost.toFixed(3)}, seedvr: $${upscaleCost.toFixed(3)})`);
+    console.log(`[GENERATE COST] Job ${jobId} (${finalFileName}) finished in ${runtimeStr}. Total: $${totalCost.toFixed(3)} (nano-banana: $${editCost.toFixed(3)}, seedvr: $${upscaleCost.toFixed(3)})`);
 
     // Backup generation to Cloudinary vault in background
     let persistentUrl = null;
@@ -299,8 +344,34 @@ async function runPipelineV2Worker(jobId, jobParams) {
       console.warn('[CLOUDINARY NOTICE] Generation backup skipped:', cErr.message);
     }
 
-    // Mark Job Done — REQUIREMENT 11: Save final prompt, instruction, and locks in run's JSON and logs
+    // Mark Job Done — Store parentId, baseUsed, version, instruction, locks, and file names
     clearTimeout(timeoutTimer);
+    const resolvedResultUrl = persistentUrl || `/api/generate/image/${finalFileName}`;
+    const resolvedOriginalUrl = originalUrl || (originalFileName ? `/api/generate/original/${originalFileName}` : null);
+
+    const resultObj = {
+      success: true,
+      jobId,
+      imageUrl: resolvedResultUrl,
+      originalUrl: resolvedOriginalUrl,
+      filename: finalFileName,
+      localFileName: finalFileName,
+      originalFileName: originalFileName || null,
+      parentId: parentId || null,
+      baseUsed: baseUsed || 'original',
+      version: version || 1,
+      sceneSlug: sceneSlug || 'photo',
+      width: finalW,
+      height: finalH,
+      upscaled: isUpscaled,
+      seed: editResult.data?.seed || editResult.seed || 42,
+      cost: totalCost,
+      instruction,
+      locks,
+      prompt: editPrompt,
+      createdAt: new Date().toISOString()
+    };
+
     updateJobRecord(jobId, {
       status: 'done',
       stage: 'complete',
@@ -309,20 +380,14 @@ async function runPipelineV2Worker(jobId, jobParams) {
       instruction,
       locks,
       prompt: editPrompt,
-      result: {
-        success: true,
-        jobId,
-        imageUrl: persistentUrl || finalImageUrl,
-        width: finalW,
-        height: finalH,
-        upscaled: isUpscaled,
-        seed: editResult.data?.seed || editResult.seed || 42,
-        cost: totalCost,
-        instruction,
-        locks,
-        prompt: editPrompt,
-        createdAt: new Date().toISOString()
-      }
+      parentId: parentId || null,
+      baseUsed: baseUsed || 'original',
+      version: version || 1,
+      filename: finalFileName,
+      localFileName: finalFileName,
+      originalFileName: originalFileName || null,
+      originalUrl: resolvedOriginalUrl,
+      result: resultObj
     });
   } catch (err) {
     clearTimeout(timeoutTimer);
@@ -336,25 +401,24 @@ async function runPipelineV2Worker(jobId, jobParams) {
       error: errorMsg,
       runtime: runtimeStr,
       instruction,
-      locks
+      locks,
+      parentId: parentId || null,
+      baseUsed: baseUsed || 'original',
+      version: version || 1
     });
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/generate
+// Handles both fresh photoshoot runs and edits of existing generated images
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/', upload.single('image'), async (req, res) => {
   try {
     const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '127.0.0.1';
     const userId = req.user?.userId || req.body?.userId;
 
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'No image uploaded. Please upload a clear photo.' });
-    }
-
-    // REQUIREMENT 7 & 8: Accept only { instruction, locks } plus the image.
-    // Block empty instruction: "Describe the scene or change you want."
+    // REQUIREMENT 1: Accept instruction (single source of truth)
     const instruction = (req.body.instruction || req.body.prompt || '').trim();
     if (!instruction) {
       return res.status(400).json({
@@ -381,7 +445,89 @@ router.post('/', upload.single('image'), async (req, res) => {
       background: rawLocks.background === true || rawLocks.background === 'true'
     };
 
-    // REQUIREMENT 6: Rate limit check (10 generations per hour per IP)
+    // REQUIREMENT 3: Support editing generated images (parentId + baseUsed)
+    const parentId = (req.body.parentId || '').trim() || null;
+    let baseUsed = (req.body.baseUsed || '').trim().toLowerCase();
+    if (!baseUsed) {
+      baseUsed = parentId ? 'result' : 'original';
+    } else if (baseUsed === 'this_result') {
+      baseUsed = 'result';
+    }
+
+    const sceneSlug = (req.body.sceneSlug || '').trim() || null;
+    const jobId = `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+    let inputBuffer = null;
+    let originalFileName = null;
+    let originalUrl = null;
+    let version = 1;
+
+    if (parentId) {
+      const parentJob = getJobRecord(parentId);
+      if (!parentJob) {
+        return res.status(404).json({ success: false, error: 'Parent photoshoot not found.' });
+      }
+
+      version = (parentJob.version || 1) + 1;
+      originalFileName = parentJob.originalFileName || `${parentId}-orig.jpg`;
+      originalUrl = parentJob.originalUrl || `/api/generate/original/${originalFileName}`;
+
+      if (baseUsed === 'result') {
+        const parentResultPath = path.join(GENERATIONS_DIR, parentJob.localFileName || `${parentId}.jpg`);
+        if (fs.existsSync(parentResultPath)) {
+          inputBuffer = fs.readFileSync(parentResultPath);
+        } else if (parentJob.imageUrl || parentJob.result?.imageUrl) {
+          try {
+            const fetchRes = await fetch(parentJob.imageUrl || parentJob.result.imageUrl);
+            if (fetchRes.ok) inputBuffer = Buffer.from(await fetchRes.arrayBuffer());
+          } catch {}
+        } else if (req.file) {
+          inputBuffer = req.file.buffer;
+        }
+
+        if (!inputBuffer) {
+          return res.status(400).json({
+            success: false,
+            error: 'The base photoshoot result has expired or is unavailable on disk.'
+          });
+        }
+      } else {
+        // baseUsed === 'original'
+        const parentOrigPath = path.join(ORIGINALS_DIR, originalFileName);
+        if (fs.existsSync(parentOrigPath)) {
+          inputBuffer = fs.readFileSync(parentOrigPath);
+        } else if (parentJob.originalUrl || parentJob.result?.originalUrl) {
+          try {
+            const fetchRes = await fetch(parentJob.originalUrl || parentJob.result.originalUrl);
+            if (fetchRes.ok) inputBuffer = Buffer.from(await fetchRes.arrayBuffer());
+          } catch {}
+        } else if (req.file) {
+          inputBuffer = req.file.buffer;
+        }
+
+        if (!inputBuffer) {
+          return res.status(400).json({
+            success: false,
+            error: 'The original reference photo has expired. Please upload a new photo.'
+          });
+        }
+      }
+    } else {
+      // Fresh new photoshoot
+      if (!req.file) {
+        return res.status(400).json({ success: false, error: 'No image uploaded. Please upload a clear photo.' });
+      }
+      inputBuffer = req.file.buffer;
+      originalFileName = `${jobId}-orig.jpg`;
+      originalUrl = `/api/generate/original/${originalFileName}`;
+      try {
+        fs.writeFileSync(path.join(ORIGINALS_DIR, originalFileName), inputBuffer);
+      } catch (writeErr) {
+        console.warn('[STORAGE] Could not write original photo:', writeErr.message);
+      }
+    }
+
+    // Rate limit check (10 generations per hour per IP)
     const rateCheck = checkIpRateLimit(clientIp);
     if (!rateCheck.allowed) {
       return res.status(429).json({
@@ -390,8 +536,8 @@ router.post('/', upload.single('image'), async (req, res) => {
       });
     }
 
-    // REQUIREMENT 4: Duplicate request guard (10 seconds)
-    const dedupKey = `${clientIp}_${userId || ''}_${instruction}_${JSON.stringify(effectiveLocks)}`;
+    // Duplicate request guard (10 seconds)
+    const dedupKey = `${clientIp}_${userId || ''}_${instruction}_${JSON.stringify(effectiveLocks)}_${parentId || ''}_${baseUsed}`;
     const lastRequestTime = recentRequests.get(dedupKey);
     if (lastRequestTime && (Date.now() - lastRequestTime < 10000)) {
       return res.status(429).json({
@@ -410,8 +556,8 @@ router.post('/', upload.single('image'), async (req, res) => {
       }
       fal.config({ credentials: falKey });
 
-      const base64Image = req.file.buffer.toString('base64');
-      const dataURI = `data:${req.file.mimetype};base64,${base64Image}`;
+      const base64Image = inputBuffer.toString('base64');
+      const dataURI = `data:image/jpeg;base64,${base64Image}`;
       const finalPrompt = instruction ? `${instruction}, ${LEGACY_REALISM_SUFFIX}` : LEGACY_REALISM_SUFFIX;
       const imageSize = mapLegacyAspectRatio(req.body.aspect_ratio);
 
@@ -448,7 +594,6 @@ router.post('/', upload.single('image'), async (req, res) => {
     }
 
     // ─── PIPELINE V2 (Default Winning Pipeline) ────────────────────────────
-    const jobId = `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const finalPrompt = buildV2Prompt(instruction, effectiveLocks);
 
     const initialJob = {
@@ -459,6 +604,11 @@ router.post('/', upload.single('image'), async (req, res) => {
       instruction,
       locks: effectiveLocks,
       prompt: finalPrompt,
+      parentId,
+      baseUsed,
+      version,
+      originalFileName,
+      originalUrl,
       createdAt: new Date().toISOString()
     };
 
@@ -466,11 +616,16 @@ router.post('/', upload.single('image'), async (req, res) => {
 
     // Launch background worker detached from request
     runPipelineV2Worker(jobId, {
-      fileBuffer: req.file.buffer,
-      mimeType: req.file.mimetype,
+      fileBuffer: inputBuffer,
       instruction,
       locks: effectiveLocks,
-      userId
+      userId,
+      parentId,
+      baseUsed,
+      version,
+      sceneSlug,
+      originalFileName,
+      originalUrl
     });
 
     // Return jobId immediately with status "queued"
@@ -478,6 +633,9 @@ router.post('/', upload.single('image'), async (req, res) => {
       success: true,
       jobId,
       status: 'queued',
+      version,
+      parentId,
+      baseUsed,
       message: 'Photoshoot job queued successfully. Poll /api/generate/status/:jobId for updates.'
     });
 
@@ -488,8 +646,248 @@ router.post('/', upload.single('image'), async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SERVE GENERATED OUTPUT IMAGES
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/image/:filename', (req, res) => {
+  const safeName = path.basename(req.params.filename);
+  const filePath = path.join(GENERATIONS_DIR, safeName);
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    return res.sendFile(filePath);
+  }
+  return res.status(404).send('Image not found or expired.');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVE ORIGINAL REFERENCE PHOTOS
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/original/:filename', (req, res) => {
+  const safeName = path.basename(req.params.filename);
+  let filePath = path.join(ORIGINALS_DIR, safeName);
+  if (!fs.existsSync(filePath) && !safeName.endsWith('.jpg')) {
+    filePath = path.join(ORIGINALS_DIR, `${safeName}.jpg`);
+  }
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    return res.sendFile(filePath);
+  }
+  return res.status(404).send('Original photo not found or expired.');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-SELECT & BATCH ZIP DOWNLOAD (STREAMED VIA ARCHIVER)
+// User-scoped, authenticated zip archive: yanga-photos-YYYYMMDD.zip
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/download-zip', async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    const { jobIds, includeOriginals, all } = req.body;
+
+    // Collect user-scoped jobs
+    const userJobMap = new Map();
+    for (const [id, job] of jobsStore.entries()) {
+      if (job.userId === userId && job.status === 'done') {
+        userJobMap.set(id, job);
+      }
+    }
+
+    // Also scan GENERATIONS_DIR for JSONs
+    try {
+      const files = fs.readdirSync(GENERATIONS_DIR);
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          const data = JSON.parse(fs.readFileSync(path.join(GENERATIONS_DIR, file), 'utf8'));
+          if (data.userId === userId && data.status === 'done' && !userJobMap.has(data.jobId)) {
+            userJobMap.set(data.jobId, data);
+          }
+        }
+      }
+    } catch {}
+
+    let targetJobs = [];
+    if (all) {
+      targetJobs = Array.from(userJobMap.values());
+    } else if (Array.isArray(jobIds) && jobIds.length > 0) {
+      targetJobs = jobIds
+        .map(id => userJobMap.get(id))
+        .filter(Boolean);
+    }
+
+    if (targetJobs.length === 0) {
+      return res.status(404).json({ success: false, error: 'No photos found to download.' });
+    }
+
+    const now = new Date();
+    const yyyymmdd = now.toISOString().slice(0, 10).replace(/-/g, '');
+    const zipName = `yanga-photos-${yyyymmdd}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+
+    const archive = archiver('zip', { zlib: { level: 6 } });
+    archive.on('error', (err) => {
+      console.error('[ZIP ARCHIVER ERROR]', err);
+      if (!res.headersSent) res.status(500).send('Failed to build zip archive.');
+    });
+
+    archive.pipe(res);
+
+    const addedEntries = new Set();
+
+    for (const job of targetJobs) {
+      const resultFileName = job.filename || job.localFileName || `${job.jobId}.jpg`;
+      const localResultPath = path.join(GENERATIONS_DIR, job.localFileName || resultFileName);
+
+      if (fs.existsSync(localResultPath) && !addedEntries.has(resultFileName)) {
+        archive.file(localResultPath, { name: resultFileName });
+        addedEntries.add(resultFileName);
+      } else if (job.result?.imageUrl || job.imageUrl) {
+        try {
+          const fetchRes = await fetch(job.result?.imageUrl || job.imageUrl);
+          if (fetchRes.ok) {
+            const buf = Buffer.from(await fetchRes.arrayBuffer());
+            archive.append(buf, { name: resultFileName });
+            addedEntries.add(resultFileName);
+          }
+        } catch {}
+      }
+
+      // If user selected "Include originals"
+      if (includeOriginals) {
+        const origFileName = job.originalFileName || `${job.jobId}-orig.jpg`;
+        const localOrigPath = path.join(ORIGINALS_DIR, origFileName);
+        const inZipOrigName = `originals/${resultFileName.replace(/\.jpg$/i, '')}-original.jpg`;
+
+        if (fs.existsSync(localOrigPath) && !addedEntries.has(inZipOrigName)) {
+          archive.file(localOrigPath, { name: inZipOrigName });
+          addedEntries.add(inZipOrigName);
+        } else if (job.originalUrl || job.result?.originalUrl) {
+          try {
+            const fetchRes = await fetch(job.originalUrl || job.result?.originalUrl);
+            if (fetchRes.ok) {
+              const buf = Buffer.from(await fetchRes.arrayBuffer());
+              archive.append(buf, { name: inZipOrigName });
+              addedEntries.add(inZipOrigName);
+            }
+          } catch {}
+        }
+      }
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error('[ZIP DOWNLOAD CRASH]', err);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PERMANENT USER PURGE: "Delete my photos now"
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete('/my-photos', async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    let deletedCount = 0;
+
+    // Purge memory store
+    for (const [id, job] of jobsStore.entries()) {
+      if (job.userId === userId) {
+        jobsStore.delete(id);
+      }
+    }
+
+    // Purge files from disk
+    if (fs.existsSync(GENERATIONS_DIR)) {
+      const files = fs.readdirSync(GENERATIONS_DIR);
+      for (const file of files) {
+        if (file.endsWith('.json')) {
+          try {
+            const jsonPath = path.join(GENERATIONS_DIR, file);
+            const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+            if (data.userId === userId) {
+              // Remove generation files
+              if (data.localFileName) {
+                const imgPath = path.join(GENERATIONS_DIR, data.localFileName);
+                if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+              }
+              const defaultImg = path.join(GENERATIONS_DIR, `${data.jobId}.jpg`);
+              if (fs.existsSync(defaultImg)) fs.unlinkSync(defaultImg);
+
+              // Remove original files
+              if (data.originalFileName) {
+                const origPath = path.join(ORIGINALS_DIR, data.originalFileName);
+                if (fs.existsSync(origPath)) fs.unlinkSync(origPath);
+              }
+              const defaultOrig = path.join(ORIGINALS_DIR, `${data.jobId}-orig.jpg`);
+              if (fs.existsSync(defaultOrig)) fs.unlinkSync(defaultOrig);
+
+              // Remove json
+              fs.unlinkSync(jsonPath);
+              deletedCount++;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    console.log(`[USER PURGE] Successfully wiped ${deletedCount} records & photos for user ${userId}.`);
+    return res.json({
+      success: true,
+      count: deletedCount,
+      message: 'All your photos and history have been permanently deleted from disk.'
+    });
+  } catch (err) {
+    console.error('[USER PURGE ERROR]', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE SINGLE PHOTO
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete('/:jobId', async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    const { jobId } = req.params;
+    const job = getJobRecord(jobId);
+
+    if (!job) {
+      return res.status(404).json({ success: false, error: 'Photo not found.' });
+    }
+    if (job.userId && job.userId !== userId) {
+      return res.status(403).json({ success: false, error: 'Unauthorized to delete this photo.' });
+    }
+
+    jobsStore.delete(jobId);
+
+    const jsonPath = path.join(GENERATIONS_DIR, `${jobId}.json`);
+    if (fs.existsSync(jsonPath)) fs.unlinkSync(jsonPath);
+
+    if (job.localFileName) {
+      const imgPath = path.join(GENERATIONS_DIR, job.localFileName);
+      if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+    }
+    const defaultImg = path.join(GENERATIONS_DIR, `${jobId}.jpg`);
+    if (fs.existsSync(defaultImg)) fs.unlinkSync(defaultImg);
+
+    return res.json({ success: true, message: 'Photo deleted successfully.' });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/generate/status/:jobId & GET /api/generate/:jobId
-// Pollable status endpoint (polls every 3s from UI)
 // ─────────────────────────────────────────────────────────────────────────────
 const handleJobStatus = (req, res) => {
   const jobId = req.params.jobId || req.params.id;

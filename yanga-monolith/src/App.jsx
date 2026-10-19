@@ -6,10 +6,56 @@ import {
   CLOTHING_REGEX 
 } from './data/studioPresets.js';
 
+/**
+ * REQUIREMENT 5: User Display Name Priority
+ * full name -> first name -> email local part. Never hardcode "Rokit Online User".
+ */
+export function getDisplayName(user) {
+  if (!user) return 'Studio Member';
+  const fullName = (user.fullName || user.name || '').trim();
+  if (fullName) return fullName;
+  const firstName = (user.firstName || '').trim();
+  if (firstName) {
+    const lastName = (user.lastName || '').trim();
+    return lastName ? `${firstName} ${lastName}` : firstName;
+  }
+  const email = (user.email || '').trim();
+  if (email && email.includes('@')) return email.split('@')[0];
+  return email || 'Studio Member';
+}
+
+const DEFAULT_LOCKS = {
+  outfit: true,
+  pose: true,
+  hair: true,
+  props: true,
+  background: false
+};
+
+function getLineageText(item) {
+  if (!item) return 'Version 1 (Initial)';
+  const version = item.version || 1;
+  const parentShort = item.parentId ? `#${item.parentId.slice(-4)}` : null;
+  if (version > 1 && parentShort) {
+    return `Version ${version}, edited from ${parentShort}`;
+  }
+  if (version > 1) {
+    return `Version ${version}`;
+  }
+  return 'Version 1 (Initial)';
+}
+
 export default function App() {
   // ─── Authentication & SSO State ───────────────────────────────────────────
   const [authChecking, setAuthChecking] = useState(true);
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState(() => {
+    try {
+      const saved = sessionStorage.getItem('yanga_user_profile');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
 
   // Login Gate State
   const [loginForm, setLoginForm] = useState({ email: '', password: '' });
@@ -26,20 +72,16 @@ export default function App() {
   const [previewUrl, setPreviewUrl] = useState(null);
 
   // Step 2: Single Source of Truth Instruction Textarea
-  const [instruction, setInstruction] = useState(SCENES[0]?.starter || '');
-  const [highlightedSceneId, setHighlightedSceneId] = useState(SCENES[0]?.id || null);
+  // REQUIREMENT 1: On first load nothing is selected, the textarea is empty, placeholder suggests an example
+  const [instruction, setInstruction] = useState('');
+  const [highlightedSceneId, setHighlightedSceneId] = useState(null);
 
-  // Lock Toggles (Defaults per spec)
-  const [locks, setLocks] = useState({
-    outfit: true,
-    pose: true,
-    hair: true,
-    props: true,
-    background: false
-  });
+  // Lock Toggles (Defaults: Outfit ON, Pose ON, Hair ON, Props ON, Background OFF)
+  const [locks, setLocks] = useState(DEFAULT_LOCKS);
 
   const [showPromptPreview, setShowPromptPreview] = useState(false);
-  const [activeCategory, setActiveCategory] = useState(SCENE_CATEGORIES[0].id);
+  // Category tabs get an "All" option (default: 'all')
+  const [activeCategory, setActiveCategory] = useState('all');
 
   // Generation & Polling State
   const [loading, setLoading] = useState(false);
@@ -48,9 +90,27 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [activeResult, setActiveResult] = useState(null);
 
+  // ─── Full-Screen Viewer State (REQUIREMENT 3) ─────────────────────────────
+  const [viewerItem, setViewerItem] = useState(null);
+  const [viewerMode, setViewerMode] = useState('result'); // 'result' | 'original'
+
+  // ─── Edit Sheet State (REQUIREMENT 3) ──────────────────────────────────────
+  const [editingItem, setEditingItem] = useState(null);
+  const [editBaseChoice, setEditBaseChoice] = useState('result'); // 'result' | 'original'
+  const [editInstruction, setEditInstruction] = useState('');
+  const [editLocks, setEditLocks] = useState(DEFAULT_LOCKS);
+
+  // ─── Gallery Card Toggle State: Result | Original (REQUIREMENT 2) ──────────
+  const [cardViewMap, setCardViewMap] = useState({}); // { [id]: 'result' | 'original' }
+
+  // ─── Multi-Select & Zip Download State (REQUIREMENT 4) ────────────────────
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [includeOriginalsZip, setIncludeOriginalsZip] = useState(false);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+
   const pollTimerRef = useRef(null);
 
-  // User's private Cloudinary photoshoot vault
+  // User's private photoshoot vault
   const [history, setHistory] = useState(() => {
     try {
       const saved = localStorage.getItem('yanga_history');
@@ -75,9 +135,11 @@ export default function App() {
       const data = await res.json();
       if (data.success && data.user) {
         setUser(data.user);
+        sessionStorage.setItem('yanga_user_profile', JSON.stringify(data.user));
         loadUserHistory(data.user._id);
       } else {
         setUser(null);
+        sessionStorage.removeItem('yanga_user_profile');
       }
     } catch (err) {
       console.warn('SSO check error:', err);
@@ -96,8 +158,8 @@ export default function App() {
       if (data.success && Array.isArray(data.history)) {
         setHistory((prev) => {
           const map = new Map();
-          data.history.forEach((item) => map.set(item.imageUrl, item));
-          prev.forEach((item) => map.set(item.imageUrl, item));
+          data.history.forEach((item) => map.set(item.jobId || item.id || item.imageUrl, item));
+          prev.forEach((item) => map.set(item.jobId || item.id || item.imageUrl, item));
           const combined = Array.from(map.values()).sort(
             (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
           );
@@ -137,6 +199,7 @@ export default function App() {
 
       if (data.user) {
         setUser(data.user);
+        sessionStorage.setItem('yanga_user_profile', JSON.stringify(data.user));
         loadUserHistory(data.user._id);
       }
     } catch (err) {
@@ -172,6 +235,7 @@ export default function App() {
 
       if (data.user) {
         setUser(data.user);
+        sessionStorage.setItem('yanga_user_profile', JSON.stringify(data.user));
         setMfaPending(false);
         setOtp('');
         loadUserHistory(data.user._id);
@@ -191,10 +255,12 @@ export default function App() {
       console.warn(err);
     }
     setUser(null);
+    sessionStorage.removeItem('yanga_user_profile');
     setFile(null);
     setPreviewUrl(null);
     setResults([]);
     setActiveResult(null);
+    setSelectedIds(new Set());
   };
 
   // ─── File Handling ────────────────────────────────────────────────────────
@@ -211,22 +277,47 @@ export default function App() {
     }
   };
 
-  // ─── Scene & Instruction Handlers ─────────────────────────────────────────
-  // REQUIREMENT 2: Tapping a scene card fills the textarea with starter text and highlights the card.
-  // REQUIREMENT 4: Selecting a scene card turns Keep my background OFF automatically.
+  // ─── Scene & Instruction Handlers (REQUIREMENT 1) ─────────────────────────
+  /**
+   * REQUIREMENT 1:
+   * Tapping a selected scene card again deselects it.
+   * If the textarea still equals that card's starter text, clear it too.
+   * If the user edited the text, keep their text.
+   * Selecting a scene card turns Keep my background OFF automatically.
+   */
   const handleSelectScene = (scene) => {
+    if (highlightedSceneId === scene.id) {
+      setHighlightedSceneId(null);
+      if (instruction.trim() === scene.starter.trim()) {
+        setInstruction('');
+      }
+      return;
+    }
     setInstruction(scene.starter);
     setHighlightedSceneId(scene.id);
     setLocks((prev) => ({ ...prev, background: false }));
     setError(null);
   };
 
-  // REQUIREMENT 2: If the user edits the text, remove the card highlight.
+  // If the user edits the text, remove the card highlight
   const handleInstructionChange = (e) => {
     const text = e.target.value;
     setInstruction(text);
-    const match = SCENES.find((s) => s.starter === text.trim());
+    const match = SCENES.find((s) => s.starter.trim() === text.trim());
     setHighlightedSceneId(match ? match.id : null);
+    setError(null);
+  };
+
+  /**
+   * REQUIREMENT 1:
+   * "Clear" button beside textarea.
+   * Clears text, deselects scene card and category tab, and resets locks to defaults.
+   */
+  const handleClearComposer = () => {
+    setInstruction('');
+    setHighlightedSceneId(null);
+    setActiveCategory('all');
+    setLocks({ ...DEFAULT_LOCKS });
     setError(null);
   };
 
@@ -234,8 +325,15 @@ export default function App() {
     setLocks((prev) => ({ ...prev, [lockKey]: !prev[lockKey] }));
   };
 
-  // Filter scenes for currently active category tab
-  const filteredScenes = SCENES.filter((s) => s.category === activeCategory);
+  const toggleEditLock = (lockKey) => {
+    setEditLocks((prev) => ({ ...prev, [lockKey]: !prev[lockKey] }));
+  };
+
+  // Filter scenes for currently active category tab ('all' shows everything)
+  const filteredScenes = activeCategory === 'all'
+    ? SCENES
+    : SCENES.filter((s) => s.category === activeCategory);
+
   const activeHighlightedScene = SCENES.find((s) => s.id === highlightedSceneId);
 
   // Exact Canonical Prompt Preview
@@ -263,11 +361,17 @@ export default function App() {
     }
   };
 
-  // ─── Generation Completion Handler ────────────────────────────────────────
+  // ─── Generation Completion Handler (REQUIREMENT 2) ────────────────────────
   const handleGenerationSuccess = (resultData) => {
     const newResult = {
       id: resultData.jobId || Date.now().toString(),
+      jobId: resultData.jobId || Date.now().toString(),
       imageUrl: resultData.imageUrl,
+      originalUrl: resultData.originalUrl || previewUrl,
+      filename: resultData.filename || resultData.localFileName,
+      parentId: resultData.parentId || null,
+      baseUsed: resultData.baseUsed || 'original',
+      version: resultData.version || 1,
       sceneTitle: activeHighlightedScene?.title || 'Custom Photoshoot',
       instruction: resultData.instruction || instruction,
       prompt: resultData.prompt || exactFinalPrompt,
@@ -284,7 +388,7 @@ export default function App() {
 
     // Persist to user history
     setHistory((prev) => {
-      const next = [newResult, ...prev.filter((x) => x.imageUrl !== newResult.imageUrl)];
+      const next = [newResult, ...prev.filter((x) => (x.jobId || x.id) !== newResult.id && x.imageUrl !== newResult.imageUrl)];
       localStorage.setItem('yanga_history', JSON.stringify(next));
       return next;
     });
@@ -320,7 +424,6 @@ export default function App() {
           setError(data.error || 'Photoshoot generation failed.');
           setLoading(false);
         } else {
-          // Dynamic stage feedback
           if (data.stage === 'editing_background') {
             setLoadingStage('Synthesizing photoshoot with Nano Banana...');
           } else if (data.stage === 'upscaling_2x') {
@@ -345,7 +448,6 @@ export default function App() {
       return;
     }
 
-    // REQUIREMENT 7: If the textarea is empty, block submit with "Describe the scene or change you want."
     const cleanInstruction = instruction.trim();
     if (!cleanInstruction) {
       setError('Describe the scene or change you want.');
@@ -356,11 +458,13 @@ export default function App() {
     setLoadingStage('Queuing photoshoot...');
     setError(null);
 
-    // REQUIREMENT 8: Send only { instruction, locks } plus the image
     const formData = new FormData();
     formData.append('image', file);
     formData.append('instruction', cleanInstruction);
     formData.append('locks', JSON.stringify(locks));
+    if (activeHighlightedScene?.id) {
+      formData.append('sceneSlug', activeHighlightedScene.id);
+    }
 
     try {
       const response = await fetch('/api/generate', {
@@ -372,6 +476,7 @@ export default function App() {
 
       if (response.status === 401) {
         setUser(null);
+        sessionStorage.removeItem('yanga_user_profile');
         setError('Your session has expired. Please log in again.');
         setLoading(false);
         return;
@@ -389,14 +494,12 @@ export default function App() {
         return;
       }
 
-      // Legacy fallback response (returns imageUrl directly)
       if (data.imageUrl) {
         handleGenerationSuccess(data);
         setLoading(false);
         return;
       }
 
-      // Pipeline v2 background job response
       if (data.jobId) {
         pollJobStatus(data.jobId);
       } else {
@@ -410,10 +513,214 @@ export default function App() {
     }
   };
 
-  const clearHistory = () => {
-    if (confirm('Clear your local photoshoot history?')) {
+  // ─── Submit Edit Request (REQUIREMENT 3) ──────────────────────────────────
+  const handleEditSubmit = async (e) => {
+    if (e) e.preventDefault();
+    if (!editingItem) return;
+
+    const cleanEditInstruction = editInstruction.trim();
+    if (!cleanEditInstruction) {
+      alert('Describe the scene or change you want to make.');
+      return;
+    }
+
+    const parentId = editingItem.jobId || editingItem.id;
+    const formData = new FormData();
+    formData.append('parentId', parentId);
+    formData.append('baseUsed', editBaseChoice);
+    formData.append('instruction', cleanEditInstruction);
+    formData.append('locks', JSON.stringify(editLocks));
+    if (editBaseChoice === 'original' && file) {
+      formData.append('image', file);
+    }
+
+    // Close edit sheet
+    setEditingItem(null);
+    setViewerItem(null);
+    setLoading(true);
+    setLoadingStage('Queuing photoshoot edit...');
+    setError(null);
+
+    try {
+      const response = await fetch('/api/generate', {
+        method: 'POST',
+        body: formData,
+        credentials: 'include'
+      });
+      const data = await response.json();
+
+      if (response.status === 401) {
+        setUser(null);
+        sessionStorage.removeItem('yanga_user_profile');
+        setError('Your session has expired. Please log in again.');
+        setLoading(false);
+        return;
+      }
+
+      if (!response.ok || !data.success) {
+        setError(data.error || 'Edit generation failed.');
+        setLoading(false);
+        return;
+      }
+
+      if (data.jobId) {
+        pollJobStatus(data.jobId);
+      } else if (data.imageUrl) {
+        handleGenerationSuccess(data);
+        setLoading(false);
+      }
+    } catch (err) {
+      console.error(err);
+      setError('Network connection failed during edit submission.');
+      setLoading(false);
+    }
+  };
+
+  // ─── Delete Actions (REQUIREMENT 3) ───────────────────────────────────────
+  const handleDeleteSinglePhoto = async (item) => {
+    const jobId = item.jobId || item.id;
+    if (!confirm('Are you sure you want to delete this photoshoot from the server?')) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/generate/${jobId}`, {
+        method: 'DELETE',
+        credentials: 'include'
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        alert(data.error || 'Failed to delete photo.');
+        return;
+      }
+
+      setResults((prev) => prev.filter((x) => (x.jobId || x.id) !== jobId));
+      setHistory((prev) => {
+        const next = prev.filter((x) => (x.jobId || x.id) !== jobId && x.imageUrl !== item.imageUrl);
+        localStorage.setItem('yanga_history', JSON.stringify(next));
+        return next;
+      });
+
+      if ((activeResult?.jobId || activeResult?.id) === jobId || activeResult?.imageUrl === item.imageUrl) {
+        setActiveResult(null);
+      }
+
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(jobId);
+        return next;
+      });
+
+      setViewerItem(null);
+    } catch (err) {
+      console.error(err);
+      alert('Error deleting photo.');
+    }
+  };
+
+  const handleDeleteAllPhotos = async () => {
+    if (!confirm('Are you sure you want to delete all your photoshoots and reference photos from the server? This will permanently remove them from disk.')) {
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/generate/my-photos', {
+        method: 'DELETE',
+        credentials: 'include'
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        alert(data.error || 'Failed to delete photos.');
+        return;
+      }
+
+      setResults([]);
       setHistory([]);
+      setActiveResult(null);
+      setSelectedIds(new Set());
       localStorage.removeItem('yanga_history');
+      alert('All your photoshoot data and originals have been deleted from disk.');
+    } catch (err) {
+      console.error(err);
+      alert('Error purging photos.');
+    }
+  };
+
+  // ─── Multi-Select & Batch Zip Download (REQUIREMENT 4) ────────────────────
+  // Combine session results and history into one unified list without duplicates
+  const allPhotosMap = new Map();
+  results.forEach((r) => allPhotosMap.set(r.jobId || r.id, r));
+  history.forEach((h) => {
+    const id = h.jobId || h.id;
+    if (!allPhotosMap.has(id)) {
+      allPhotosMap.set(id, h);
+    }
+  });
+  const allPhotos = Array.from(allPhotosMap.values());
+
+  const handleSelectAll = () => {
+    const next = new Set();
+    allPhotos.forEach((item) => {
+      const id = item.jobId || item.id;
+      if (id) next.add(id);
+    });
+    setSelectedIds(next);
+  };
+
+  const handleClearSelection = () => {
+    setSelectedIds(new Set());
+  };
+
+  const handleToggleCardView = (id, e) => {
+    if (e) e.stopPropagation();
+    setCardViewMap((prev) => ({
+      ...prev,
+      [id]: prev[id] === 'original' ? 'result' : 'original'
+    }));
+  };
+
+  const handleDownloadZip = async (isAll = false) => {
+    const idsToDownload = isAll ? [] : Array.from(selectedIds);
+    if (!isAll && idsToDownload.length === 0) {
+      alert('Please select at least one photo to download.');
+      return;
+    }
+
+    setDownloadingZip(true);
+    try {
+      const res = await fetch('/api/generate/download-zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          all: isAll,
+          jobIds: idsToDownload,
+          includeOriginals: includeOriginalsZip
+        }),
+        credentials: 'include'
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        alert(errData.error || 'Failed to download zip archive.');
+        return;
+      }
+
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      const now = new Date();
+      const yyyymmdd = now.toISOString().slice(0, 10).replace(/-/g, '');
+      link.download = `yanga-photos-${yyyymmdd}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch (err) {
+      console.error(err);
+      alert('Error building zip file.');
+    } finally {
+      setDownloadingZip(false);
     }
   };
 
@@ -449,13 +756,6 @@ export default function App() {
           <div className="bg-neutral-900/90 border border-neutral-800 rounded-2xl p-6 md:p-8 shadow-2xl backdrop-blur-sm">
             {!mfaPending ? (
               <form onSubmit={handleLoginSubmit} className="space-y-4">
-                <div className="text-center pb-2">
-                  <h2 className="text-lg font-bold text-white">Sign In to Continue</h2>
-                  <p className="text-xs text-neutral-400 mt-0.5">
-                    Use your central Rokit Media account to access AI photoshoot credits.
-                  </p>
-                </div>
-
                 {loginError && (
                   <div className="p-3 rounded-xl bg-red-950/50 border border-red-800/60 text-red-300 text-xs flex items-center gap-2">
                     <span>⚠️</span>
@@ -464,34 +764,38 @@ export default function App() {
                 )}
 
                 <div>
-                  <label className="block text-xs font-semibold text-neutral-300 mb-1">Email Address</label>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-300 mb-1.5">
+                    Rokit Account Email
+                  </label>
                   <input
                     type="email"
                     value={loginForm.email}
                     onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
                     required
-                    placeholder="your@rokitonline.com"
-                    className="w-full bg-neutral-950 border border-neutral-700 focus:border-amber-500 text-white text-xs px-3.5 py-3 rounded-xl outline-none transition-colors"
+                    placeholder="user@example.com"
+                    className="w-full bg-neutral-950 border border-neutral-800 focus:border-amber-500 text-white text-xs px-3.5 py-2.5 rounded-xl outline-none transition-colors"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-neutral-300 mb-1">Password</label>
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-300 mb-1.5">
+                    Password
+                  </label>
                   <div className="relative">
                     <input
                       type={showPassword ? 'text' : 'password'}
                       value={loginForm.password}
                       onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
                       required
-                      placeholder="••••••••••••"
-                      className="w-full bg-neutral-950 border border-neutral-700 focus:border-amber-500 text-white text-xs px-3.5 py-3 rounded-xl outline-none transition-colors pr-10"
+                      placeholder="••••••••"
+                      className="w-full bg-neutral-950 border border-neutral-800 focus:border-amber-500 text-white text-xs px-3.5 py-2.5 rounded-xl outline-none transition-colors pr-10"
                     />
                     <button
                       type="button"
                       onClick={() => setShowPassword(!showPassword)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-neutral-300 text-xs"
+                      className="absolute right-3 top-2.5 text-xs text-neutral-500 hover:text-neutral-300"
                     >
-                      {showPassword ? 'Hide' : 'Show'}
+                      {showPassword ? '🙈' : '👁️'}
                     </button>
                   </div>
                 </div>
@@ -591,12 +895,15 @@ export default function App() {
   // ─── AUTHENTICATED STUDIO VIEW ───────────────────────────────────────────
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 md:p-8 flex flex-col items-center">
-      {/* Top Bar / Member Banner */}
+      {/* REQUIREMENT 5: Top Bar / Member Banner showing User's Real Name */}
       <div className="w-full max-w-5xl flex items-center justify-between py-2 px-4 mb-6 rounded-xl bg-neutral-900/60 border border-neutral-800 text-xs">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
           <span className="text-neutral-400">Member:</span>
-          <span className="text-neutral-200 font-semibold">{user.email || 'Rokit Online User'}</span>
+          <span className="text-neutral-200 font-semibold">{getDisplayName(user)}</span>
+          {user.email && user.email !== getDisplayName(user) && (
+            <span className="text-[11px] text-neutral-400 hidden sm:inline">({user.email})</span>
+          )}
           <span className="hidden sm:inline-block px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px]">
             SSO Active
           </span>
@@ -645,6 +952,10 @@ export default function App() {
               {previewUrl ? (
                 <div className="relative group rounded-lg overflow-hidden flex items-center justify-center bg-black/40">
                   <img src={previewUrl} alt="Reference Preview" className="h-44 object-contain rounded-lg" />
+                  {/* REQUIREMENT 2: Original label on reference thumbnail */}
+                  <span className="absolute top-2 left-2 bg-black/80 text-amber-400 border border-amber-500/40 text-[10px] font-bold px-2 py-0.5 rounded shadow">
+                    Original
+                  </span>
                   <label className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center text-xs font-medium text-amber-400 cursor-pointer rounded-lg transition-opacity">
                     Click to change photo
                     <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleFileChange} className="hidden" />
@@ -668,10 +979,22 @@ export default function App() {
                 <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">2</span>
                 <span>Describe your photo</span>
               </label>
-              <span className="text-[10px] text-neutral-400">Single source of truth</span>
+              <div className="flex items-center gap-2">
+                {/* REQUIREMENT 1: Clear button beside textarea */}
+                <button
+                  type="button"
+                  onClick={handleClearComposer}
+                  className="text-[11px] text-neutral-400 hover:text-amber-400 border border-neutral-800 hover:border-neutral-700 bg-neutral-950/60 px-2.5 py-0.5 rounded-md transition-colors"
+                  title="Clear text, deselect scene card, reset category tab, and restore default locks"
+                >
+                  Clear
+                </button>
+                <span className="text-[10px] text-neutral-500 hidden sm:inline">Single source of truth</span>
+              </div>
             </div>
 
             {/* Editable Textarea: Instruction */}
+            {/* REQUIREMENT 1: Placeholder suggests an example */}
             <textarea
               id="instructionField"
               value={instruction}
@@ -681,7 +1004,7 @@ export default function App() {
               className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 text-xs p-3.5 rounded-xl outline-none focus:border-amber-500 transition-colors leading-relaxed resize-y"
             />
 
-            {/* REQUIREMENT 5: Clothing hint when instruction mentions clothing and Keep my outfit is ON */}
+            {/* Clothing mention check */}
             {clothingMentioned && (
               <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-2 mt-2">
                 <span className="flex items-center gap-1.5">
@@ -792,7 +1115,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* REQUIREMENT 6: Collapsed Prompt Preview */}
+            {/* Collapsed Prompt Preview */}
             <div className="mt-3.5">
               <button
                 type="button"
@@ -819,12 +1142,12 @@ export default function App() {
               </label>
               {highlightedSceneId && (
                 <span className="text-[10px] text-amber-400 font-semibold">
-                  Card highlighted
+                  Card selected ✓ (Tap again to deselect)
                 </span>
               )}
             </div>
 
-            {/* Horizontal Scrollable Category Tabs */}
+            {/* Category Tabs with "All" Option */}
             <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
               {SCENE_CATEGORIES.map((c) => (
                 <button
@@ -909,33 +1232,54 @@ export default function App() {
                   <div className="flex flex-col">
                     <span className="text-xs font-bold text-amber-400 uppercase tracking-wider">{activeResult.sceneTitle || 'AI Photoshoot'}</span>
                     <div className="flex items-center gap-2 mt-0.5">
-                      <span className="text-[10px] text-neutral-500">
-                        {new Date(activeResult.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      <span className="text-[10px] text-neutral-400 font-mono">
+                        {getLineageText(activeResult)}
                       </span>
                       {activeResult.width && activeResult.height && (
                         <span className="text-[10px] font-mono text-neutral-500">
-                          {activeResult.width}×{activeResult.height}px
+                          • {activeResult.width}×{activeResult.height}px
                         </span>
                       )}
-                      <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700/60">
-                        AI-generated image
-                      </span>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleDownload(activeResult.imageUrl, activeResult.sceneTitle)}
-                    className="text-xs text-neutral-200 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5 rounded-lg border border-neutral-700 transition-colors flex items-center gap-1.5"
-                  >
-                    <span>Save HD Photo</span>
-                    <span>⬇️</span>
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingItem(activeResult);
+                        setEditInstruction(activeResult.instruction || '');
+                        setEditLocks(activeResult.locks || DEFAULT_LOCKS);
+                        setEditBaseChoice('result');
+                      }}
+                      className="text-xs text-neutral-200 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-2.5 py-1.5 rounded-lg border border-neutral-700 transition-colors flex items-center gap-1"
+                    >
+                      <span>✏️ Edit</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownload(activeResult.imageUrl, activeResult.sceneTitle)}
+                      className="text-xs text-neutral-200 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-2.5 py-1.5 rounded-lg border border-neutral-700 transition-colors flex items-center gap-1"
+                    >
+                      <span>⬇️</span>
+                    </button>
+                  </div>
                 </div>
-                <img
-                  src={activeResult.imageUrl}
-                  alt={activeResult.instruction || activeResult.prompt || 'Generated Photoshoot'}
-                  className="w-full max-h-[520px] object-cover rounded-xl shadow-2xl border-2 border-neutral-800"
-                />
+                <div 
+                  className="relative group cursor-pointer w-full rounded-xl overflow-hidden border-2 border-neutral-800"
+                  onClick={() => {
+                    setViewerItem(activeResult);
+                    setViewerMode('result');
+                  }}
+                >
+                  <img
+                    src={activeResult.imageUrl}
+                    alt={activeResult.instruction || activeResult.prompt || 'Generated Photoshoot'}
+                    className="w-full max-h-[520px] object-cover group-hover:scale-[1.01] transition-transform duration-200"
+                  />
+                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity text-xs font-semibold text-white">
+                    Tap to expand full screen ↗
+                  </div>
+                </div>
               </div>
             ) : loading ? (
               <div className="flex flex-col items-center justify-center text-center py-16">
@@ -972,96 +1316,590 @@ export default function App() {
               </div>
 
               <div className="flex flex-col gap-3">
-                {results.map((r, idx) => (
-                  <div
-                    key={r.id || idx}
-                    onClick={() => setActiveResult(r)}
-                    className={`cursor-pointer rounded-xl p-2.5 border transition-all flex items-center justify-between gap-3 ${
-                      activeResult?.imageUrl === r.imageUrl
-                        ? 'border-amber-500 bg-amber-500/10 ring-1 ring-amber-500/30'
-                        : 'border-neutral-800 bg-neutral-950/60 hover:border-neutral-700'
-                    }`}
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <img src={r.imageUrl} alt={r.sceneTitle} className="w-16 h-16 object-cover rounded-lg flex-shrink-0 border border-neutral-800" />
-                      <div className="min-w-0">
-                        <div className="text-xs font-semibold text-neutral-200 truncate">{r.sceneTitle}</div>
-                        <div className="text-[10px] text-neutral-500 mt-0.5 truncate max-w-xs">
-                          {r.instruction || (new Date(r.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}
-                          {r.width && r.height ? ` • ${r.width}×${r.height}` : ''}
+                {results.map((r) => {
+                  const rId = r.jobId || r.id;
+                  const isViewingOrig = cardViewMap[rId] === 'original';
+                  const displayImg = isViewingOrig ? (r.originalUrl || previewUrl || r.imageUrl) : r.imageUrl;
+
+                  return (
+                    <div
+                      key={rId}
+                      className={`rounded-xl p-2.5 border transition-all flex items-center justify-between gap-3 ${
+                        activeResult?.imageUrl === r.imageUrl
+                          ? 'border-amber-500 bg-amber-500/10 ring-1 ring-amber-500/30'
+                          : 'border-neutral-800 bg-neutral-950/60 hover:border-neutral-700'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        {/* Multi-Select Checkbox */}
+                        <input
+                          type="checkbox"
+                          checked={selectedIds.has(rId)}
+                          onChange={(e) => {
+                            e.stopPropagation();
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(rId)) next.delete(rId);
+                              else next.add(rId);
+                              return next;
+                            });
+                          }}
+                          className="w-4 h-4 rounded border-neutral-700 bg-neutral-900 text-amber-500 focus:ring-amber-500/50 cursor-pointer flex-shrink-0"
+                        />
+
+                        {/* Thumbnail with Result | Original Toggle & Click to View */}
+                        <div 
+                          className="relative group cursor-pointer w-16 h-16 rounded-lg overflow-hidden flex-shrink-0 border border-neutral-800"
+                          onClick={() => {
+                            setViewerItem(r);
+                            setViewerMode(isViewingOrig ? 'original' : 'result');
+                          }}
+                        >
+                          <img src={displayImg} alt={r.sceneTitle} className="w-full h-full object-cover" />
+                          {isViewingOrig && (
+                            <span className="absolute top-1 left-1 bg-amber-500 text-neutral-950 text-[8px] font-black uppercase px-1 rounded">
+                              Orig
+                            </span>
+                          )}
                         </div>
-                        <div className="text-[9px] text-neutral-400 mt-1 inline-block">
-                          AI-generated image
+
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold text-neutral-200 truncate">{r.sceneTitle}</div>
+                          <div className="text-[10px] text-neutral-400 mt-0.5 truncate max-w-xs font-mono">
+                            {getLineageText(r)}
+                          </div>
+                          <div className="flex items-center gap-2 mt-1">
+                            {/* Result | Original Toggle */}
+                            <button
+                              type="button"
+                              onClick={(e) => handleToggleCardView(rId, e)}
+                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-300 hover:text-amber-400 border border-neutral-700 transition-colors"
+                            >
+                              {isViewingOrig ? 'Show Result' : 'Show Original'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingItem(r);
+                                setEditInstruction(r.instruction || '');
+                                setEditLocks(r.locks || DEFAULT_LOCKS);
+                                setEditBaseChoice('result');
+                              }}
+                              className="text-[9px] font-semibold text-neutral-400 hover:text-white"
+                            >
+                              Edit ✏️
+                            </button>
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDownload(r.imageUrl, r.sceneTitle);
-                      }}
-                      className="text-[11px] text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-2.5 py-1 rounded-md border border-neutral-700 flex-shrink-0 transition-colors"
-                    >
-                      Save HD ⬇️
-                    </button>
-                  </div>
-                ))}
+                      <div className="flex items-center gap-1.5 flex-shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleDownload(r.imageUrl, r.sceneTitle)}
+                          className="text-[11px] text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-2 py-1 rounded-md border border-neutral-700 transition-colors"
+                        >
+                          ⬇️
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteSinglePhoto(r)}
+                          className="text-[11px] text-neutral-500 hover:text-red-400 px-1 py-1 transition-colors"
+                          title="Delete photo"
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* ─── Bottom Section: Cloudinary Saved Vault ───────────────────────── */}
-      {history.length > 0 && (
-        <section className="w-full max-w-5xl mt-12 bg-neutral-900/60 p-6 md:p-8 rounded-2xl border border-neutral-800/80">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h2 className="text-lg font-bold text-white flex items-center gap-2">
-                <span>📁 Your Saved Photoshoots</span>
-                <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                  Rokit User Vault
-                </span>
-              </h2>
-              <p className="text-xs text-neutral-400 mt-0.5">
-                Saved in your dedicated Cloudinary storage (<code className="text-amber-400/80">yanga-generations/{user._id}</code>).
+      {/* ─── Bottom Section: Saved Photoshoots & Batch Management ─────────── */}
+      <section className="w-full max-w-5xl mt-12 bg-neutral-900/60 p-6 md:p-8 rounded-2xl border border-neutral-800/80">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+          <div>
+            <h2 className="text-lg font-bold text-white flex items-center gap-2">
+              <span>📁 Studio Gallery & History</span>
+              <span className="text-[11px] font-normal px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                {allPhotos.length} Photos
+              </span>
+            </h2>
+            <p className="text-xs text-neutral-400 mt-0.5">
+              Originals & generations retained for 7 days. Tap any image to inspect, edit, or download.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleDeleteAllPhotos}
+            className="text-xs text-red-400 hover:text-red-300 bg-red-950/30 hover:bg-red-950/60 border border-red-800/50 px-3 py-1.5 rounded-lg transition-colors font-medium self-start md:self-auto"
+          >
+            Delete my photos now 🗑️
+          </button>
+        </div>
+
+        {/* REQUIREMENT 4: Batch Actions Toolbar */}
+        <div className="w-full bg-neutral-950/80 border border-neutral-800 rounded-xl p-3 mb-6 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleSelectAll}
+              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-3 py-1.5 rounded-lg border border-neutral-700 font-medium transition-colors"
+            >
+              Select All ({allPhotos.length})
+            </button>
+            <button
+              type="button"
+              onClick={handleClearSelection}
+              disabled={selectedIds.size === 0}
+              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg border border-neutral-700 transition-colors"
+            >
+              Clear Selection
+            </button>
+            <label className="flex items-center gap-1.5 text-neutral-300 cursor-pointer select-none ml-2">
+              <input
+                type="checkbox"
+                checked={includeOriginalsZip}
+                onChange={(e) => setIncludeOriginalsZip(e.target.checked)}
+                className="rounded border-neutral-700 text-amber-500 focus:ring-amber-500/50"
+              />
+              <span className="text-[11px]">Include originals in zip</span>
+            </label>
+          </div>
+
+          <div className="flex items-center flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={selectedIds.size === 0 || downloadingZip}
+              onClick={() => handleDownloadZip(false)}
+              className="bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold px-3 py-1.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5 shadow"
+            >
+              {downloadingZip ? (
+                <>
+                  <div className="w-3.5 h-3.5 border-2 border-neutral-950 border-t-transparent rounded-full animate-spin"></div>
+                  <span>Archiving...</span>
+                </>
+              ) : (
+                <>
+                  <span>Download Selected ({selectedIds.size})</span>
+                  <span>📦</span>
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              disabled={allPhotos.length === 0 || downloadingZip}
+              onClick={() => handleDownloadZip(true)}
+              className="bg-neutral-800 hover:bg-neutral-700 text-amber-400 hover:text-amber-300 border border-neutral-700 font-semibold px-3 py-1.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              Download All
+            </button>
+          </div>
+        </div>
+
+        {/* Gallery Cards Grid */}
+        {allPhotos.length > 0 ? (
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+            {allPhotos.map((item) => {
+              const itemId = item.jobId || item.id;
+              const isSelected = selectedIds.has(itemId);
+              const isViewingOrig = cardViewMap[itemId] === 'original';
+              const displayImg = isViewingOrig ? (item.originalUrl || previewUrl || item.imageUrl) : item.imageUrl;
+
+              return (
+                <div
+                  key={itemId}
+                  className={`group relative bg-neutral-950 rounded-xl overflow-hidden border transition-all shadow-md flex flex-col ${
+                    isSelected ? 'border-amber-500 ring-2 ring-amber-500/40' : 'border-neutral-800 hover:border-neutral-700'
+                  }`}
+                >
+                  {/* Top Overlay: Checkbox & Result | Original Toggle */}
+                  <div className="absolute top-2 left-2 right-2 z-10 flex items-center justify-between">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={(e) => {
+                        e.stopPropagation();
+                        setSelectedIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(itemId)) next.delete(itemId);
+                          else next.add(itemId);
+                          return next;
+                        });
+                      }}
+                      className="w-4 h-4 rounded border-neutral-700 bg-neutral-950 text-amber-500 focus:ring-amber-500/50 cursor-pointer shadow"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={(e) => handleToggleCardView(itemId, e)}
+                      className="text-[9px] font-bold px-2 py-0.5 rounded-md bg-black/80 text-neutral-300 hover:text-white border border-neutral-700 backdrop-blur-sm transition-colors shadow"
+                    >
+                      {isViewingOrig ? 'Result ↺' : 'Original ↺'}
+                    </button>
+                  </div>
+
+                  {/* Thumbnail Image — Tapping opens Full-Screen Viewer (REQUIREMENT 3) */}
+                  <div
+                    className="relative cursor-pointer overflow-hidden h-44 bg-neutral-900"
+                    onClick={() => {
+                      setViewerItem(item);
+                      setViewerMode(isViewingOrig ? 'original' : 'result');
+                    }}
+                  >
+                    <img
+                      src={displayImg}
+                      alt={item.sceneTitle || item.instruction || 'Photoshoot'}
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                    />
+                    {isViewingOrig && (
+                      <span className="absolute bottom-2 left-2 bg-amber-500 text-neutral-950 text-[9px] font-black uppercase px-1.5 py-0.5 rounded shadow">
+                        Original Photo
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Card Footer Info */}
+                  <div className="p-2.5 flex flex-col justify-between flex-1 bg-neutral-950">
+                    <div>
+                      <p className="text-[11px] text-white font-medium line-clamp-1">
+                        {item.sceneTitle || item.instruction || 'AI Photoshoot'}
+                      </p>
+                      <p className="text-[10px] text-neutral-400 font-mono mt-0.5 truncate">
+                        {getLineageText(item)}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-2 mt-2 border-t border-neutral-900">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingItem(item);
+                          setEditInstruction(item.instruction || '');
+                          setEditLocks(item.locks || DEFAULT_LOCKS);
+                          setEditBaseChoice('result');
+                        }}
+                        className="text-[10px] text-amber-400 hover:text-amber-300 font-semibold"
+                      >
+                        ✏️ Edit
+                      </button>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleDownload(item.imageUrl, item.sceneTitle)}
+                          className="text-[11px] text-neutral-400 hover:text-white"
+                          title="Download photo"
+                        >
+                          ⬇️
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteSinglePhoto(item)}
+                          className="text-[11px] text-neutral-500 hover:text-red-400"
+                          title="Delete photo"
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="text-center py-12 text-neutral-500 text-xs">
+            No photoshoot history saved yet.
+          </div>
+        )}
+      </section>
+
+      {/* ─── FULL-SCREEN VIEWER MODAL (REQUIREMENT 3) ─────────────────────── */}
+      {viewerItem && (
+        <div className="fixed inset-0 z-50 bg-black/95 flex flex-col backdrop-blur-md">
+          {/* Header */}
+          <div className="flex items-center justify-between p-4 border-b border-neutral-800 bg-neutral-950/80">
+            <div className="flex flex-col min-w-0 pr-4">
+              <h3 className="text-sm font-bold text-white truncate">
+                {viewerItem.sceneTitle || 'Photoshoot Preview'}
+              </h3>
+              <p className="text-[11px] text-amber-400 font-mono mt-0.5">
+                {getLineageText(viewerItem)}
               </p>
             </div>
+
+            {/* Result | Original Toggle */}
+            <div className="flex items-center bg-neutral-900 border border-neutral-700 rounded-lg p-0.5">
+              <button
+                type="button"
+                onClick={() => setViewerMode('result')}
+                className={`px-3 py-1 rounded-md text-xs font-semibold transition-colors ${
+                  viewerMode === 'result' ? 'bg-amber-500 text-neutral-950' : 'text-neutral-400 hover:text-white'
+                }`}
+              >
+                Result
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewerMode('original')}
+                className={`px-3 py-1 rounded-md text-xs font-semibold transition-colors ${
+                  viewerMode === 'original' ? 'bg-amber-500 text-neutral-950' : 'text-neutral-400 hover:text-white'
+                }`}
+              >
+                Original
+              </button>
+            </div>
+
             <button
-              onClick={clearHistory}
-              className="text-xs text-neutral-500 hover:text-red-400 transition-colors"
+              type="button"
+              onClick={() => setViewerItem(null)}
+              className="text-neutral-400 hover:text-white text-lg p-2 transition-colors ml-2"
             >
-              Clear Local View
+              ✕
             </button>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-            {history.map((item, idx) => (
-              <div
-                key={item.id || idx}
-                onClick={() => setActiveResult(item)}
-                className="group relative bg-neutral-950 rounded-xl overflow-hidden border border-neutral-800 hover:border-amber-500/60 cursor-pointer transition-all shadow-md"
-              >
-                <img
-                  src={item.imageUrl}
-                  alt={item.prompt || 'Generated Photoshoot'}
-                  className="w-full h-40 object-cover group-hover:scale-105 transition-transform duration-300"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity p-2.5 flex flex-col justify-end">
-                  <p className="text-[11px] text-white font-medium line-clamp-2">
-                    {item.sceneTitle || item.prompt || 'AI Photoshoot'}
-                  </p>
-                  <div className="flex items-center justify-between mt-1">
-                    <span className="text-[9px] text-neutral-400">AI-generated image</span>
-                    <span className="text-[10px] text-amber-400 font-semibold">View</span>
-                  </div>
-                </div>
-              </div>
-            ))}
+          {/* Main Photo View */}
+          <div className="flex-1 flex items-center justify-center p-4 min-h-0 relative">
+            <img
+              src={viewerMode === 'original' ? (viewerItem.originalUrl || previewUrl || viewerItem.imageUrl) : viewerItem.imageUrl}
+              alt="Photoshoot Full Preview"
+              className="max-h-full max-w-full object-contain rounded-xl shadow-2xl"
+            />
+            <span className="absolute bottom-6 left-6 bg-black/80 text-neutral-200 border border-neutral-700 text-xs font-semibold px-2.5 py-1 rounded-lg backdrop-blur-sm">
+              {viewerMode === 'original' ? 'Original Reference Photo' : 'Super-Resolution Generated Result'}
+            </span>
           </div>
-        </section>
+
+          {/* Viewer Footer: Instruction, Locks & Actions */}
+          <div className="p-4 border-t border-neutral-800 bg-neutral-950/80 flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-wider block">Instruction Used:</span>
+              <p className="text-xs text-neutral-300 italic line-clamp-2 mt-0.5">
+                "{viewerItem.instruction || viewerItem.prompt}"
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 self-end md:self-auto flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setEditingItem(viewerItem);
+                  setEditInstruction(viewerItem.instruction || '');
+                  setEditLocks(viewerItem.locks || DEFAULT_LOCKS);
+                  setEditBaseChoice('result');
+                  setViewerItem(null);
+                }}
+                className="bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold px-3 py-1.5 rounded-lg text-xs transition-colors flex items-center gap-1 shadow"
+              >
+                <span>✏️ Edit</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleDownload(
+                  viewerMode === 'original' ? (viewerItem.originalUrl || previewUrl || viewerItem.imageUrl) : viewerItem.imageUrl,
+                  viewerItem.sceneTitle
+                )}
+                className="bg-neutral-800 hover:bg-neutral-700 text-white font-medium px-3 py-1.5 rounded-lg text-xs border border-neutral-700 transition-colors flex items-center gap-1"
+              >
+                <span>Download</span>
+                <span>⬇️</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleDeleteSinglePhoto(viewerItem)}
+                className="bg-red-950/40 hover:bg-red-950/70 text-red-400 border border-red-800/60 font-medium px-3 py-1.5 rounded-lg text-xs transition-colors flex items-center gap-1"
+              >
+                <span>Delete</span>
+                <span>🗑️</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ─── EDIT SHEET MODAL (REQUIREMENT 3) ─────────────────────────────── */}
+      {editingItem && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm">
+          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
+              <div>
+                <h3 className="text-base font-bold text-white flex items-center gap-2">
+                  <span>Edit Photoshoot</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                    Next Version: v{(editingItem.version || 1) + 1}
+                  </span>
+                </h3>
+                <p className="text-xs text-neutral-400 mt-0.5">
+                  Lineage: {getLineageText(editingItem)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingItem(null)}
+                className="text-neutral-400 hover:text-white text-lg p-1 transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Base Choice */}
+            <div>
+              <label className="block text-xs font-bold uppercase tracking-wider text-neutral-300 mb-2">
+                Choose Base Photo
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEditBaseChoice('result')}
+                  className={`p-2.5 rounded-xl border text-left text-xs transition-all ${
+                    editBaseChoice === 'result'
+                      ? 'border-amber-500 bg-amber-500/15 text-white ring-1 ring-amber-500/30'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:border-neutral-700'
+                  }`}
+                >
+                  <div className="font-semibold text-neutral-200">This result</div>
+                  <div className="text-[10px] text-neutral-500 mt-0.5">Iterate on current scene</div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setEditBaseChoice('original')}
+                  disabled={!editingItem.originalUrl && !file}
+                  className={`p-2.5 rounded-xl border text-left text-xs transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+                    editBaseChoice === 'original'
+                      ? 'border-amber-500 bg-amber-500/15 text-white ring-1 ring-amber-500/30'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:border-neutral-700'
+                  }`}
+                >
+                  <div className="font-semibold text-neutral-200">Original photo</div>
+                  <div className="text-[10px] text-neutral-500 mt-0.5">Highest facial fidelity</div>
+                </button>
+              </div>
+
+              {/* Requirement 3 Hint */}
+              <p className="text-[11px] text-amber-300/90 mt-2 bg-amber-500/10 border border-amber-500/20 p-2 rounded-lg leading-relaxed">
+                💡 Original photo keeps your face most accurate. Edit this result is best for small changes.
+              </p>
+            </div>
+
+            {/* Instruction Textarea */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-bold uppercase tracking-wider text-neutral-300">
+                  Instruction
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setEditInstruction('')}
+                  className="text-[11px] text-neutral-400 hover:text-amber-400 border border-neutral-800 px-2 py-0.5 rounded transition-colors"
+                >
+                  Clear
+                </button>
+              </div>
+              <textarea
+                value={editInstruction}
+                onChange={(e) => setEditInstruction(e.target.value)}
+                rows={3}
+                placeholder="Describe changes (e.g. Place me on a street at sunset, change shirt to black jacket)..."
+                className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 text-xs p-3 rounded-xl outline-none focus:border-amber-500 transition-colors resize-y leading-relaxed"
+              />
+            </div>
+
+            {/* Lock Toggles */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-neutral-400">Keep Rules</span>
+                <span className="text-[10px] text-emerald-400">🔒 Face always locked</span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => toggleEditLock('outfit')}
+                  className={`p-2 rounded-lg text-left border text-xs flex items-center justify-between ${
+                    editLocks.outfit ? 'border-amber-500/80 bg-amber-500/15 text-amber-300' : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                  }`}
+                >
+                  <span className="text-[11px]">Keep outfit</span>
+                  <span className="text-[10px] font-bold">{editLocks.outfit ? 'ON' : 'OFF'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => toggleEditLock('pose')}
+                  className={`p-2 rounded-lg text-left border text-xs flex items-center justify-between ${
+                    editLocks.pose ? 'border-amber-500/80 bg-amber-500/15 text-amber-300' : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                  }`}
+                >
+                  <span className="text-[11px]">Keep pose</span>
+                  <span className="text-[10px] font-bold">{editLocks.pose ? 'ON' : 'OFF'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => toggleEditLock('hair')}
+                  className={`p-2 rounded-lg text-left border text-xs flex items-center justify-between ${
+                    editLocks.hair ? 'border-amber-500/80 bg-amber-500/15 text-amber-300' : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                  }`}
+                >
+                  <span className="text-[11px]">Keep hair</span>
+                  <span className="text-[10px] font-bold">{editLocks.hair ? 'ON' : 'OFF'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => toggleEditLock('props')}
+                  className={`p-2 rounded-lg text-left border text-xs flex items-center justify-between ${
+                    editLocks.props ? 'border-amber-500/80 bg-amber-500/15 text-amber-300' : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                  }`}
+                >
+                  <span className="text-[11px]">Keep props</span>
+                  <span className="text-[10px] font-bold">{editLocks.props ? 'ON' : 'OFF'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => toggleEditLock('background')}
+                  className={`p-2 rounded-lg text-left border text-xs flex items-center justify-between ${
+                    editLocks.background ? 'border-amber-500/80 bg-amber-500/15 text-amber-300' : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                  }`}
+                >
+                  <span className="text-[11px]">Keep background</span>
+                  <span className="text-[10px] font-bold">{editLocks.background ? 'ON' : 'OFF'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-neutral-800">
+              <button
+                type="button"
+                onClick={() => setEditingItem(null)}
+                className="px-4 py-2 rounded-xl text-xs font-semibold text-neutral-400 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleEditSubmit}
+                disabled={!editInstruction.trim()}
+                className="bg-amber-500 hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed text-neutral-950 font-bold px-5 py-2.5 rounded-xl text-xs transition-all shadow-lg shadow-amber-500/10 flex items-center gap-1.5"
+              >
+                <span>Generate Edit</span>
+                <span>✨</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

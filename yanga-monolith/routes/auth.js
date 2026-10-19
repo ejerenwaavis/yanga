@@ -24,9 +24,51 @@ const setSSOCookie = (res, req, token) => {
   res.cookie('rokit_sso_token', token, cookieOptions);
 };
 
+// In-memory profile cache for central Rokit SSO users
+const userProfileCache = new Map();
+const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+/**
+ * Fetch user profile from central Rokit Online backend
+ */
+async function fetchRokitProfile(token, userId) {
+  if (userProfileCache.has(userId)) {
+    const cached = userProfileCache.get(userId);
+    if (Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+      return cached.profile;
+    }
+  }
+
+  try {
+    const res = await fetch(`${ROKIT_API_URL}/auth/me`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Cookie': `rokit_sso_token=${token}`
+      }
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data && (data.name || data.email)) {
+        userProfileCache.set(userId, { profile: data, cachedAt: Date.now() });
+        return data;
+      }
+    } else {
+      console.warn(`[ROKIT SSO] /auth/me returned status ${res.status}`);
+    }
+  } catch (err) {
+    console.warn('[ROKIT SSO] Could not reach Rokit /auth/me:', err.message);
+  }
+
+  // Graceful fallback to any existing stale cache
+  return userProfileCache.get(userId)?.profile || null;
+}
+
 /**
  * GET /api/auth/me
  * Checks if incoming request has a valid SSO token (via cookie or Authorization header)
+ * and retrieves user's full name & email from central Rokit profile
  */
 router.get('/me', async (req, res) => {
   try {
@@ -45,13 +87,20 @@ router.get('/me', async (req, res) => {
     }
 
     const userId = decoded.id || decoded.userId || decoded._id;
+    const profile = await fetchRokitProfile(token, userId);
+
+    const fullName = profile?.name || decoded.name || null;
+    const userEmail = profile?.email || decoded.email || null;
+
     return res.json({
       success: true,
       authenticated: true,
       user: {
         _id: userId,
-        email: decoded.email || null,
-        role: decoded.role || 'customer'
+        name: fullName,
+        fullName: fullName,
+        email: userEmail,
+        role: profile?.role || decoded.role || 'customer'
       }
     });
   } catch (err) {
@@ -90,11 +139,18 @@ router.post('/login', async (req, res) => {
     // If login returned a full session token
     if (data.token) {
       setSSOCookie(res, req, data.token);
+      if (data._id) {
+        userProfileCache.set(data._id, {
+          profile: { _id: data._id, name: data.name, email: data.email, role: data.role },
+          cachedAt: Date.now()
+        });
+      }
       return res.json({
         success: true,
         user: {
           _id: data._id,
           name: data.name,
+          fullName: data.name,
           email: data.email,
           role: data.role
         },
@@ -134,11 +190,18 @@ router.post('/verify-mfa', async (req, res) => {
 
     if (data.token) {
       setSSOCookie(res, req, data.token);
+      if (data._id) {
+        userProfileCache.set(data._id, {
+          profile: { _id: data._id, name: data.name, email: data.email, role: data.role },
+          cachedAt: Date.now()
+        });
+      }
       return res.json({
         success: true,
         user: {
           _id: data._id,
           name: data.name,
+          fullName: data.name,
           email: data.email,
           role: data.role
         },

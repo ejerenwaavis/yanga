@@ -4,11 +4,27 @@
  */
 
 export const SCENE_CATEGORIES = [
+  { id: 'all', label: 'All' },
   { id: 'celebration', label: 'Birthday & Luxe' },
   { id: 'beach', label: 'Beach & Resort' },
   { id: 'owambe', label: 'Owambe & Cultural' },
   { id: 'lifestyle', label: 'Travel & Studio' }
 ];
+
+export function getSceneSlug(sceneIdOrInstruction) {
+  if (!sceneIdOrInstruction) return 'photo';
+  const match = SCENES.find(s => s.id === sceneIdOrInstruction || s.starter === sceneIdOrInstruction);
+  if (match) {
+    return match.id.replace(/_/g, '-');
+  }
+  return sceneIdOrInstruction
+    .toLowerCase()
+    .replace(/^place me (in|on|at|along)\s+/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 30)
+    .replace(/-+$/, '') || 'photo';
+}
 
 export const SCENES = [
   // ─── Celebration & Birthday Luxe ──────────────────────────────────────────
