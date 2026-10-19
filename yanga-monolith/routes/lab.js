@@ -78,13 +78,17 @@ const router = express.Router();
 
 // Fallback pricing table per run (in USD)
 const MODEL_PRICING = {
-  'fal-ai/flux-pro/kontext': 0.040,
+  'fal-ai/flux-pro/kontext': 0.050,
   'fal-ai/flux-pulid': 0.035,
-  'fal-ai/clarity-upscaler': 0.020,
-  'fal-ai/nano-banana/edit': 0.015,
-  'fal-ai/nano-banana-pro': 0.025,
-  'fal-ai/bytedance/seedream/v4.5/edit': 0.025,
-  'fal-ai/bytedance/seedream/v4/edit': 0.020,
+  'fal-ai/clarity-upscaler': 0.015,
+  'fal-ai/nano-banana/edit': 0.039,               // Presets E & E2: $0.039
+  'fal-ai/nano-banana-2/edit': 0.120,             // Preset G (2K): $0.120
+  'fal-ai/gemini-3-pro-image-preview/edit': 0.150,// Preset H (2K): $0.150
+  'fal-ai/bytedance/seedream/v4.5/edit': 0.035,   // Preset F: $0.035
+  'fal-ai/bytedance/seedream/v4/edit': 0.035,
+  'fal-ai/esrgan': 0.005,                         // ESRGAN 2x: $0.005
+  'fal-ai/seedvr/upscale/image': 0.005,           // SeedVR2 2x: $0.005
+  'fal-ai/aura-sr': 0.010,                        // Aura-SR 2x: $0.010
   'realism_pass': 0.000
 };
 
@@ -126,6 +130,76 @@ async function getOriginalPhotoMetadata() {
     console.warn('[LAB] Could not read original photo metadata:', err.message);
     return { width: 1080, height: 1350, ratio: 0.8, ratioEnum: '4:5' };
   }
+}
+
+/**
+ * REQUIREMENT 2 & 6: Enrich saved run record with exact pixel dimensions using sharp,
+ * check >3% aspect ratio mismatch, populate modelResponseUrl, and persist if updated.
+ */
+async function enrichRunRecord(record, origMeta) {
+  if (!record || record.status !== 'done') return record;
+  let changed = false;
+
+  // 1. Read pixel dimensions with sharp if missing
+  if (!record.dimensions || !record.dimensions.width || !record.dimensions.height) {
+    const jpgFile = path.join(RESULTS_DIR, `${record.id}.jpg`);
+    const pngFile = path.join(RESULTS_DIR, `${record.id}.png`);
+    const targetFile = fs.existsSync(jpgFile) ? jpgFile : (fs.existsSync(pngFile) ? pngFile : null);
+    if (targetFile) {
+      try {
+        const meta = await sharp(targetFile).metadata();
+        if (meta.width && meta.height) {
+          record.dimensions = { width: meta.width, height: meta.height };
+          changed = true;
+        }
+      } catch (e) {
+        console.warn(`[LAB] Could not read metadata for ${record.id}:`, e.message);
+      }
+    }
+  }
+
+  // 2. Calculate aspect ratio mismatch (differs by > 3%)
+  if (record.dimensions && record.dimensions.width && record.dimensions.height && origMeta && origMeta.ratio) {
+    const genRatio = record.dimensions.width / record.dimensions.height;
+    const diffPct = Math.abs(genRatio - origMeta.ratio) / origMeta.ratio;
+    const isMismatch = diffPct > 0.03;
+    if (record.aspectMismatch !== isMismatch) {
+      record.aspectMismatch = isMismatch;
+      changed = true;
+    }
+    if (!record.origDimensions) {
+      record.origDimensions = { width: origMeta.width, height: origMeta.height };
+      changed = true;
+    }
+  }
+
+  // 3. Ensure modelResponseUrl is populated from remoteUrl
+  if (record.remoteUrl && !record.modelResponseUrl) {
+    record.modelResponseUrl = record.remoteUrl;
+    changed = true;
+  }
+
+  // 4. Update Preset E/E2 cost estimate if needed
+  if ((record.preset === 'E' || record.preset === 'E2') && (record.cost === 0.015 || record.cost === 0.025)) {
+    record.cost = 0.039;
+    record.costIsEstimate = true;
+    changed = true;
+  }
+
+  // 5. Ensure costIsEstimate is explicitly defined
+  if (record.costIsEstimate === undefined) {
+    record.costIsEstimate = true;
+    changed = true;
+  }
+
+  if (changed) {
+    try {
+      const jsonFile = path.join(RESULTS_DIR, `${record.id}.json`);
+      fs.writeFileSync(jsonFile, JSON.stringify(record, null, 2), 'utf8');
+    } catch {}
+  }
+
+  return record;
 }
 
 /**
@@ -498,11 +572,47 @@ async function processRunJob(runId, jobParams) {
       modelId = 'fal-ai/nano-banana/edit';
       modelInput = { prompt: editPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed, aspect_ratio: aspectEnum };
       estimatedCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
+    } else if (preset === 'E2') {
+      presetLabel = 'Preset E2 (Nano Banana Desk-Preserve)';
+      modelId = 'fal-ai/nano-banana/edit';
+      const deskPrompt = (mode === 'scene_outfit' && outfit && outfit.trim())
+        ? `Replace only the room and view behind the person with ${scene.trim()}. Change the person's outfit to: ${outfit.trim()}. Keep the person, desk, laptop, notebook, printer, papers and everything on the desk exactly as in the photo. Natural unretouched photo.`
+        : `Replace only the room and view behind the person with ${scene.trim()}. Keep the person, desk, laptop, notebook, printer, papers and everything on the desk exactly as in the photo. Natural unretouched photo.`;
+      modelInput = { prompt: deskPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed, aspect_ratio: aspectEnum };
+      estimatedCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
     } else if (preset === 'F') {
       presetLabel = 'Preset F (Seedream Edit)';
       modelId = 'fal-ai/bytedance/seedream/v4.5/edit';
       modelInput = { prompt: editPrompt, image_urls: [photoUrl], image_url: photoUrl, num_images: 1, seed: numSeed };
       estimatedCost = MODEL_PRICING['fal-ai/bytedance/seedream/v4.5/edit'];
+    } else if (preset === 'G') {
+      presetLabel = 'Preset G (Nano Banana 2 Edit, 2K)';
+      modelId = 'fal-ai/nano-banana-2/edit';
+      modelInput = {
+        prompt: editPrompt,
+        image_urls: [photoUrl],
+        image_url: photoUrl,
+        num_images: 1,
+        seed: numSeed,
+        resolution: '2K',
+        image_size: '2K',
+        aspect_ratio: aspectEnum
+      };
+      estimatedCost = MODEL_PRICING['fal-ai/nano-banana-2/edit'];
+    } else if (preset === 'H') {
+      presetLabel = 'Preset H (Nano Banana Pro Edit, 2K)';
+      modelId = 'fal-ai/gemini-3-pro-image-preview/edit';
+      modelInput = {
+        prompt: editPrompt,
+        image_urls: [photoUrl],
+        image_url: photoUrl,
+        num_images: 1,
+        seed: numSeed,
+        resolution: '2K',
+        image_size: '2K',
+        aspect_ratio: aspectEnum
+      };
+      estimatedCost = MODEL_PRICING['fal-ai/gemini-3-pro-image-preview/edit'];
     } else if (preset === 'custom' && customConfig) {
       presetLabel = 'Custom Run';
       modelId = customConfig.model || 'fal-ai/flux-pulid';
@@ -511,7 +621,7 @@ async function processRunJob(runId, jobParams) {
         if (modelId.includes('kontext')) {
           modelInput.image_url = photoUrl;
           if (!modelInput.aspect_ratio) modelInput.aspect_ratio = aspectEnum;
-        } else if (modelId.includes('banana') || modelId.includes('seedream')) {
+        } else if (modelId.includes('banana') || modelId.includes('seedream') || modelId.includes('gemini')) {
           modelInput.image_urls = [photoUrl];
           modelInput.image_url = photoUrl;
         } else {
@@ -545,7 +655,27 @@ async function processRunJob(runId, jobParams) {
       throw new Error(`No image URL returned by ${modelId}. Result: ` + JSON.stringify(result));
     }
 
-    const actualCost = result.data?.usage?.cost ?? result.usage?.cost ?? result.data?.cost ?? estimatedCost;
+    // REQUIREMENT 1: Use actual fal billing/usage if returned, otherwise label 'est.'
+    let falBillingCost = null;
+    let costIsEstimate = true;
+    if (result.cost != null) {
+      falBillingCost = parseFloat(result.cost);
+      costIsEstimate = false;
+    } else if (result.billing?.total != null) {
+      falBillingCost = parseFloat(result.billing.total);
+      costIsEstimate = false;
+    } else if (result.usage?.cost != null) {
+      falBillingCost = parseFloat(result.usage.cost);
+      costIsEstimate = false;
+    } else if (result.data?.cost != null) {
+      falBillingCost = parseFloat(result.data.cost);
+      costIsEstimate = false;
+    } else if (result.data?.usage?.cost != null) {
+      falBillingCost = parseFloat(result.data.usage.cost);
+      costIsEstimate = false;
+    }
+
+    const finalCost = (!costIsEstimate && falBillingCost != null) ? falBillingCost : estimatedCost;
 
     // Preset D multi-stage
     if (isPipelineD) {
@@ -575,12 +705,13 @@ async function processRunJob(runId, jobParams) {
 
     if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
 
-    // Measure output dimensions
+    // REQUIREMENT 2: Measure output dimensions with sharp and flag mismatch if > 3%
     const genMeta = await sharp(finalBuffer).metadata();
     const genW = genMeta.width || 0;
     const genH = genMeta.height || 0;
     const genRatio = genH ? (genW / genH) : 1;
-    const aspectMismatch = Math.abs(genRatio - origMeta.ratio) > 0.08;
+    const diffPct = Math.abs(genRatio - origMeta.ratio) / (origMeta.ratio || 1);
+    const aspectMismatch = diffPct > 0.03;
 
     const localFileName = `${runId}.jpg`;
     const localFilePath = path.join(RESULTS_DIR, localFileName);
@@ -589,16 +720,18 @@ async function processRunJob(runId, jobParams) {
     const runtimeMs = Date.now() - startTime;
     const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
 
-    // Mark as done on disk
+    // REQUIREMENT 6: Save model's original response URL (modelResponseUrl & remoteUrl) in run JSON
     updateRunRecord(runId, {
       status: 'done',
       model: isPipelineD ? 'flux-pro/kontext + clarity-upscaler + film grain' : modelId,
       params: modelInput,
       seed: modelInput.seed ?? numSeed,
       runtime: runtimeStr,
-      cost: typeof actualCost === 'number' ? actualCost : parseFloat(actualCost) || estimatedCost,
+      cost: finalCost,
+      costIsEstimate,
       imageUrl: `/api/lab/results/${localFileName}`,
       remoteUrl: finalImageUrl,
+      modelResponseUrl: finalImageUrl,
       dimensions: { width: genW, height: genH },
       origDimensions: { width: origMeta.width, height: origMeta.height },
       aspectMismatch
@@ -877,7 +1010,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       <div class="card-title" style="justify-content:space-between;flex-wrap:wrap;gap:8px;">
         <div style="display:flex;align-items:center;gap:8px;">
           <span class="num">3</span>
-          <span>Image-Edit & In-Context Models (A through F)</span>
+          <span>Image-Edit & In-Context Models (A through H)</span>
         </div>
         <div style="display:flex;gap:6px;">
           <button type="button" class="res-btn" onclick="toggleAllPresets(true)">Select All</button>
@@ -891,7 +1024,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="preset-header">
             <span class="p-tag">Preset A</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.040</span>
+              <span class="p-cost">~$0.050 est.</span>
               <input type="checkbox" class="preset-checkbox" id="chkPresetA" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
@@ -899,7 +1032,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="p-desc">In-context background & outfit swap. Locks exact face, hair, and pose.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">flux-pro/kontext</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyA" onclick="event.stopPropagation(); promptRunOnly('A', 'FLUX.1 Kontext', 0.040);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyA" onclick="event.stopPropagation(); promptRunOnly('A', 'FLUX.1 Kontext', 0.050);">
               ⚡ Run only this
             </button>
           </div>
@@ -910,7 +1043,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="preset-header">
             <span class="p-tag">Preset B</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.035</span>
+              <span class="p-cost">~$0.035 est.</span>
               <input type="checkbox" class="preset-checkbox" id="chkPresetB" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
@@ -929,7 +1062,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="preset-header">
             <span class="p-tag">Preset C</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.035</span>
+              <span class="p-cost">~$0.035 est.</span>
               <input type="checkbox" class="preset-checkbox" id="chkPresetC" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
@@ -948,7 +1081,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="preset-header">
             <span class="p-tag">Preset D</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.060</span>
+              <span class="p-cost">~$0.065 est.</span>
               <input type="checkbox" class="preset-checkbox" id="chkPresetD" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
@@ -956,7 +1089,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="p-desc">Preset A output &rarr; Clarity Upscaler (creativity 0.2) &rarr; Film Grain (&sigma;&approx;2).</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">Multi-Stage</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyD" onclick="event.stopPropagation(); promptRunOnly('D', 'Kontext + Upscale + Grain', 0.060);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyD" onclick="event.stopPropagation(); promptRunOnly('D', 'Kontext + Upscale + Grain', 0.065);">
               ⚡ Run only this
             </button>
           </div>
@@ -967,7 +1100,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="preset-header">
             <span class="p-tag">Preset E</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.015</span>
+              <span class="p-cost">~$0.039 est.</span>
               <input type="checkbox" class="preset-checkbox" id="chkPresetE" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
@@ -975,7 +1108,26 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="p-desc">Gemini multimodal image editor. Edits background while preserving human subject.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">nano-banana</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyE" onclick="event.stopPropagation(); promptRunOnly('E', 'Nano Banana Edit', 0.015);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyE" onclick="event.stopPropagation(); promptRunOnly('E', 'Nano Banana Edit', 0.039);">
+              ⚡ Run only this
+            </button>
+          </div>
+        </div>
+
+        <!-- Preset E2: Nano Banana Desk-Preserve -->
+        <div class="preset-card selected" id="cardPresetE2" onclick="toggleCardSelection('E2', event)">
+          <div class="preset-header">
+            <span class="p-tag">Preset E2</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.039 est.</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetE2" checked onclick="event.stopPropagation(); updateSelectedCount();">
+            </div>
+          </div>
+          <div class="p-title">Nano Banana Desk-Preserve</div>
+          <div class="p-desc">Replaces only room & view behind person; preserves person, desk, laptop, notebook, printer, papers and items exactly.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">nano-banana (desk lock)</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyE2" onclick="event.stopPropagation(); promptRunOnly('E2', 'Nano Banana Desk-Preserve', 0.039);">
               ⚡ Run only this
             </button>
           </div>
@@ -986,7 +1138,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="preset-header">
             <span class="p-tag">Preset F</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.025</span>
+              <span class="p-cost">~$0.035 est.</span>
               <input type="checkbox" class="preset-checkbox" id="chkPresetF" checked onclick="event.stopPropagation(); updateSelectedCount();">
             </div>
           </div>
@@ -994,7 +1146,45 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <div class="p-desc">ByteDance Seedream image-to-image editor with high compositional accuracy.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">seedream edit</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyF" onclick="event.stopPropagation(); promptRunOnly('F', 'Seedream Edit', 0.025);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyF" onclick="event.stopPropagation(); promptRunOnly('F', 'Seedream Edit', 0.035);">
+              ⚡ Run only this
+            </button>
+          </div>
+        </div>
+
+        <!-- Preset G: Nano Banana 2 Edit (2K) -->
+        <div class="preset-card selected" id="cardPresetG" onclick="toggleCardSelection('G', event)">
+          <div class="preset-header">
+            <span class="p-tag">Preset G</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.120 est.</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetG" checked onclick="event.stopPropagation(); updateSelectedCount();">
+            </div>
+          </div>
+          <div class="p-title">Nano Banana 2 Edit (2K)</div>
+          <div class="p-desc">Gemini 3.1 Flash Image. Native 2K output with 9:16 aspect ratio preservation and reasoning-guided edits.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">nano-banana-2 2K</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyG" onclick="event.stopPropagation(); promptRunOnly('G', 'Nano Banana 2 Edit (2K)', 0.120);">
+              ⚡ Run only this
+            </button>
+          </div>
+        </div>
+
+        <!-- Preset H: Nano Banana Pro Edit (2K) -->
+        <div class="preset-card selected" id="cardPresetH" onclick="toggleCardSelection('H', event)">
+          <div class="preset-header">
+            <span class="p-tag">Preset H</span>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="p-cost">~$0.150 est.</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetH" checked onclick="event.stopPropagation(); updateSelectedCount();">
+            </div>
+          </div>
+          <div class="p-title">Nano Banana Pro Edit (2K)</div>
+          <div class="p-desc">Gemini 3 Pro Image Preview. Deep reasoning, studio-quality character and facial consistency at 2K.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
+            <span style="font-size:0.7rem;color:var(--amber);">gemini-3-pro edit 2K</span>
+            <button type="button" class="run-only-btn" id="btnRunOnlyH" onclick="event.stopPropagation(); promptRunOnly('H', 'Nano Banana Pro Edit (2K)', 0.150);">
               ⚡ Run only this
             </button>
           </div>
@@ -1003,7 +1193,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
       <!-- Run Selected Button & Progress Bar -->
       <button type="button" class="btn-run-all" id="btnRunSelected" onclick="runSelectedSequential()">
-        <span id="runSelectedLabel">⚡ Run Selected Presets (6 of 6 Selected)</span>
+        <span id="runSelectedLabel">⚡ Run Selected Presets (9 of 9 Selected)</span>
       </button>
       <div id="runProgressText" style="font-size:0.78rem;color:var(--amber);font-weight:600;display:none;"></div>
       <div id="progressBar" class="progress-bar">
@@ -1034,7 +1224,10 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <button type="button" class="res-btn" onclick="populateCustomPreset('B')">Load B</button>
           <button type="button" class="res-btn" onclick="populateCustomPreset('C')">Load C</button>
           <button type="button" class="res-btn" onclick="populateCustomPreset('E')">Load E</button>
+          <button type="button" class="res-btn" onclick="populateCustomPreset('E2')">Load E2</button>
           <button type="button" class="res-btn" onclick="populateCustomPreset('F')">Load F</button>
+          <button type="button" class="res-btn" onclick="populateCustomPreset('G')">Load G</button>
+          <button type="button" class="res-btn" onclick="populateCustomPreset('H')">Load H</button>
         </div>
         <button type="button" class="upload-btn-label" id="btnRunCustom" style="background:var(--amber);color:#000;border:none;font-weight:700;" onclick="runCustom()">
           ▶ Run Custom Config
@@ -1163,7 +1356,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
 
     function updateSelectedCount() {
-      const all = ['A', 'B', 'C', 'D', 'E', 'F'];
+      const all = ['A', 'B', 'C', 'D', 'E', 'E2', 'F', 'G', 'H'];
       let count = 0;
       all.forEach(p => {
         const chk = document.getElementById('chkPreset' + p);
@@ -1177,7 +1370,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
 
     function toggleAllPresets(checked) {
-      ['A', 'B', 'C', 'D', 'E', 'F'].forEach(p => {
+      ['A', 'B', 'C', 'D', 'E', 'E2', 'F', 'G', 'H'].forEach(p => {
         const chk = document.getElementById('chkPreset' + p);
         const card = document.getElementById('cardPreset' + p);
         if (chk) chk.checked = checked;
@@ -1188,7 +1381,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     // REQUIREMENT 3: Explicit "Run only this" with cost confirmation
     function promptRunOnly(preset, name, cost) {
-      const formattedCost = '$' + cost.toFixed(3);
+      const formattedCost = '~\$' + cost.toFixed(3) + ' est.';
       if (confirm(\`Run \${name} now? (\${formattedCost})\`)) {
         runPreset(preset);
       }
@@ -1342,18 +1535,23 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         const jsonStr = JSON.stringify(r.params || {}, null, 2);
         const rating = r.rating || 0;
         const notes = r.notes || '';
-        const costBadge = r.cost != null ? \`<span class="res-cost">💰 $\${parseFloat(r.cost).toFixed(3)}</span>\` : '';
+        const isEst = r.costIsEstimate !== false;
+        const costNum = parseFloat(r.cost || 0).toFixed(3);
+        const costBadge = r.cost != null ? \`<span class="res-cost" title="\${isEst ? 'Estimated compute pricing' : 'Actual Fal billing data'}">💰 \${isEst ? '~$' : '$'}\${costNum}\${isEst ? ' est.' : ''}</span>\` : '';
         const parentBadge = r.parentRunId ? \`<span class="res-badge" style="background:rgba(59,130,246,0.15);color:#60a5fa;">🔗 Linked to #\${r.parentRunId}</span>\` : '';
 
-        // Dimensions badge & aspect mismatch warning
+        // Dimensions badge & aspect mismatch warning (> 3% threshold)
         let dimsBadge = '';
         if (r.dimensions && r.dimensions.width && r.dimensions.height) {
           dimsBadge = \`<span class="res-dims">\${r.dimensions.width} &times; \${r.dimensions.height}</span>\`;
         }
         let mismatchPill = '';
         if (r.aspectMismatch) {
-          mismatchPill = \`<span class="mismatch-badge">⚠️ Aspect Ratio Differs from Original</span>\`;
+          mismatchPill = \`<span class="mismatch-badge">⚠️ Aspect Ratio Differs from Original (>3%)</span>\`;
         }
+
+        // REQUIREMENT 6: Debug direct Fal CDN URL
+        const falLink = (r.modelResponseUrl || r.remoteUrl) ? \`<a href="\${r.modelResponseUrl || r.remoteUrl}" target="_blank" class="res-model" style="color:var(--amber);text-decoration:underline;" title="Direct Fal CDN Media URL">🌐 Fal Media</a>\` : '';
 
         const isChecked = selectedForDelete.has(r.id);
         const isCompared = selectedForCompare.has(r.id);
@@ -1450,15 +1648,33 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
                 \${dimsBadge}
                 \${mismatchPill}
                 \${costBadge}
+                \${falLink}
                 <span style="color:var(--text-muted);">\${new Date(r.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
               </div>
               <div class="res-actions">
                 <button type="button" class="res-btn" style="\${isCompared ? 'background:var(--amber);color:#000;font-weight:700;' : ''}" onclick="toggleCompareRun('\${r.id}')">
                   \${isCompared ? '✓ Comparing' : '🔍 Compare'}
                 </button>
+                <button type="button" class="res-btn upscale" style="border-color:#38bdf8;color:#38bdf8;" onclick="toggleUpscalePanel('\${r.id}')">🔬 Upscale Pass</button>
                 <button type="button" class="res-btn realism" onclick="toggleRealismPanel('\${r.id}')">✨ Realism Pass</button>
                 <a href="\${genUrl}" download="\${r.id}.jpg" target="_blank" class="res-btn">⬇ Download</a>
                 <button type="button" class="res-btn delete" onclick="deleteRun('\${r.id}')">🗑 Delete</button>
+              </div>
+            </div>
+
+            <!-- REQUIREMENT 5: Upscale Pass Panel (ESRGAN, SeedVR, Aura-SR at 2x) -->
+            <div id="upscalePanel-\${r.id}" class="upscale-panel" style="display:none;background:#18181b;padding:12px;border-radius:8px;margin-bottom:12px;border:1px solid #38bdf8;flex-direction:column;gap:8px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
+                <span style="font-size:0.75rem;font-weight:700;color:#38bdf8;">Non-Generative 2x Super-Resolution (Zero Sharpening • Zero Grain)</span>
+                <span style="font-size:0.72rem;color:var(--text-muted);">Linked to parent #\${r.id}</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                <select id="upscaleModel-\${r.id}" style="background:#09090b;color:#fff;border:1px solid #3f3f46;border-radius:6px;padding:6px 10px;font-size:0.78rem;">
+                  <option value="fal-ai/esrgan">ESRGAN 2x (Classic crisp edge super-res) — ~$0.005 est.</option>
+                  <option value="fal-ai/seedvr/upscale/image">SeedVR2 2x (Clean artifact removal) — ~$0.005 est.</option>
+                  <option value="fal-ai/aura-sr">Aura-SR 2x (GigaGAN photorealistic super-res) — ~$0.010 est.</option>
+                </select>
+                <button type="button" class="res-btn" id="btnRunUpscale-\${r.id}" style="background:#38bdf8;color:#000;font-weight:700;border:none;" onclick="applyUpscalePass('\${r.id}')">▶ Run 2x Upscale</button>
               </div>
             </div>
 
@@ -1727,6 +1943,40 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       }
     }
 
+    // REQUIREMENT 5: Upscale Pass Handlers
+    function toggleUpscalePanel(id) {
+      const panel = document.getElementById('upscalePanel-' + id);
+      if (panel) {
+        panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+      }
+    }
+
+    async function applyUpscalePass(parentId) {
+      showError(null);
+      const select = document.getElementById('upscaleModel-' + parentId);
+      const model = select?.value || 'fal-ai/esrgan';
+      const btn = document.getElementById('btnRunUpscale-' + parentId);
+      const origText = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ Upscaling 2x...'; }
+
+      try {
+        const res = await labFetch('/api/lab/results/' + encodeURIComponent(parentId) + '/upscale', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, scale: 2 })
+        });
+        const data = await res.json();
+        if (!data.success) {
+          throw new Error(data.error || 'Upscale failed.');
+        }
+        await loadResults();
+      } catch (err) {
+        showError('Upscale Error: ' + err.message);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = origText; }
+      }
+    }
+
     async function submitRun(preset, customConfig = null) {
       showError(null);
       const scene = document.getElementById('sceneInput').value;
@@ -1914,12 +2164,32 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       } else if (preset === 'E') {
         cfg = {
           model: 'fal-ai/nano-banana/edit',
-          input: { prompt: editPrompt, num_images: 1, seed: seed }
+          input: { prompt: editPrompt, num_images: 1, seed: seed, aspect_ratio: '9:16' }
+        };
+      } else if (preset === 'E2') {
+        cfg = {
+          model: 'fal-ai/nano-banana/edit',
+          input: {
+            prompt: 'Replace only the room and view behind the person with ' + scene + '. Keep the person, desk, laptop, notebook, printer, papers and everything on the desk exactly as in the photo. Natural unretouched photo.',
+            num_images: 1,
+            seed: seed,
+            aspect_ratio: '9:16'
+          }
         };
       } else if (preset === 'F') {
         cfg = {
           model: 'fal-ai/bytedance/seedream/v4.5/edit',
           input: { prompt: editPrompt, num_images: 1, seed: seed }
+        };
+      } else if (preset === 'G') {
+        cfg = {
+          model: 'fal-ai/nano-banana-2/edit',
+          input: { prompt: editPrompt, num_images: 1, seed: seed, resolution: '2K', aspect_ratio: '9:16' }
+        };
+      } else if (preset === 'H') {
+        cfg = {
+          model: 'fal-ai/gemini-3-pro-image-preview/edit',
+          input: { prompt: editPrompt, num_images: 1, seed: seed, resolution: '2K', image_size: '2K', aspect_ratio: '9:16' }
         };
       }
       document.getElementById('customJsonInput').value = JSON.stringify(cfg, null, 2);
@@ -1998,19 +2268,21 @@ router.get('/api/lab/original', labAuthMiddleware, (req, res) => {
 
 /**
  * GET /api/lab/results
- * Returns all saved runs sorted newest first
+ * Returns all saved runs enriched with exact pixel dimensions and aspect mismatch
  */
-router.get('/api/lab/results', labAuthMiddleware, (req, res) => {
+router.get('/api/lab/results', labAuthMiddleware, async (req, res) => {
   try {
+    const origMeta = await getOriginalPhotoMetadata();
     const files = fs.readdirSync(RESULTS_DIR).filter(f => f.endsWith('.json'));
-    const results = files.map(file => {
+    const results = [];
+    for (const file of files) {
       try {
         const content = fs.readFileSync(path.join(RESULTS_DIR, file), 'utf8');
-        return JSON.parse(content);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
+        const parsed = JSON.parse(content);
+        const enriched = await enrichRunRecord(parsed, origMeta);
+        results.push(enriched);
+      } catch {}
+    }
 
     results.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     res.json({ success: true, results });
@@ -2166,11 +2438,12 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
       seed: parentSeed,
       runtime: '0.3s',
       cost: 0.000,
+      costIsEstimate: false,
       timestamp: new Date().toISOString(),
       imageUrl: `/api/lab/results/${localFileName}`,
       dimensions: { width: genMeta.width || 0, height: genMeta.height || 0 },
       origDimensions: { width: origMeta.width, height: origMeta.height },
-      aspectMismatch: Math.abs((genMeta.width / genMeta.height) - origMeta.ratio) > 0.08,
+      aspectMismatch: Math.abs((genMeta.width / genMeta.height) - origMeta.ratio) / (origMeta.ratio || 1) > 0.03,
       rating: 0,
       notes: `Realism pass applied to run ${parentRunId}`
     };
@@ -2184,29 +2457,177 @@ router.post('/api/lab/realism-pass', labAuthMiddleware, async (req, res) => {
 });
 
 /**
+ * POST /api/lab/results/:id/upscale
+ * REQUIREMENT 5: Non-generative 2x upscaler pass (ESRGAN, SeedVR2, Aura-SR)
+ * No sharpening and no grain. Saves as a new result linked to parent with dimensions shown.
+ */
+router.post('/api/lab/results/:id/upscale', labAuthMiddleware, async (req, res) => {
+  const parentRunId = req.params.id;
+  const { model: requestedModel = 'fal-ai/esrgan' } = req.body;
+
+  const parentJpg = path.join(RESULTS_DIR, `${parentRunId}.jpg`);
+  const parentPng = path.join(RESULTS_DIR, `${parentRunId}.png`);
+  let parentFilePath = fs.existsSync(parentJpg) ? parentJpg : (fs.existsSync(parentPng) ? parentPng : null);
+
+  if (!parentFilePath) {
+    return res.status(404).json({ success: false, error: 'Parent image not found.' });
+  }
+
+  const falKey = process.env.FAL_KEY;
+  if (!falKey) {
+    return res.status(500).json({ success: false, error: 'FAL_KEY is missing in server environment.' });
+  }
+
+  try {
+    fal.config({ credentials: falKey });
+    const startTime = Date.now();
+
+    const parentBuffer = fs.readFileSync(parentFilePath);
+    const parentMeta = await sharp(parentBuffer).metadata();
+    const parentW = parentMeta.width || 1080;
+    const parentH = parentMeta.height || 1920;
+
+    const parentFalUrl = await uploadToFalStorage(parentBuffer, 'image/jpeg');
+
+    let modelId = requestedModel;
+    let modelInput = {};
+    let modelLabel = '';
+    let estimatedCost = 0.005;
+
+    if (modelId === 'fal-ai/aura-sr') {
+      modelLabel = 'Aura-SR 2x';
+      modelInput = { image_url: parentFalUrl, checkpoint: 'v2', overlapping_tiles: false };
+      estimatedCost = MODEL_PRICING['fal-ai/aura-sr'] || 0.010;
+    } else if (modelId === 'fal-ai/seedvr/upscale/image') {
+      modelLabel = 'SeedVR2 2x';
+      modelInput = { image_url: parentFalUrl, upscale_mode: 'factor', factor: 2 };
+      estimatedCost = MODEL_PRICING['fal-ai/seedvr/upscale/image'] || 0.005;
+    } else {
+      modelId = 'fal-ai/esrgan';
+      modelLabel = 'ESRGAN 2x';
+      modelInput = { image_url: parentFalUrl, scale: 2 };
+      estimatedCost = MODEL_PRICING['fal-ai/esrgan'] || 0.005;
+    }
+
+    console.log(`[LAB UPSCALE] Running ${modelLabel} (${modelId}) on ${parentRunId}...`);
+    const result = await fal.subscribe(modelId, { input: modelInput });
+
+    const upscaledUrl = result.data?.image?.url || result.data?.images?.[0]?.url || result.image?.url || result.images?.[0]?.url;
+    if (!upscaledUrl) {
+      throw new Error(`Upscaler returned no image URL. Output: ` + JSON.stringify(result));
+    }
+
+    const upRes = await fetch(upscaledUrl);
+    if (!upRes.ok) throw new Error(`Failed to download upscaled image: ${upRes.statusText}`);
+    let upscaledBuffer = Buffer.from(await upRes.arrayBuffer());
+
+    // Aura-SR natively scales 4x; resize to exact 2x of parent without sharpening or grain
+    if (modelId === 'fal-ai/aura-sr') {
+      const targetW = Math.round(parentW * 2);
+      const targetH = Math.round(parentH * 2);
+      upscaledBuffer = await sharp(upscaledBuffer)
+        .resize(targetW, targetH, { fit: 'fill' })
+        .jpeg({ quality: 96 })
+        .toBuffer();
+    }
+
+    const genMeta = await sharp(upscaledBuffer).metadata();
+    const origMeta = await getOriginalPhotoMetadata();
+    const genW = genMeta.width || (parentW * 2);
+    const genH = genMeta.height || (parentH * 2);
+    const genRatio = genH ? (genW / genH) : 1;
+    const diffPct = Math.abs(genRatio - origMeta.ratio) / (origMeta.ratio || 1);
+    const aspectMismatch = diffPct > 0.03;
+
+    let parentSeed = null;
+    try {
+      const parentJson = JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, `${parentRunId}.json`), 'utf8'));
+      parentSeed = parentJson.seed ?? null;
+    } catch {}
+
+    const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const localFileName = `${runId}.jpg`;
+    fs.writeFileSync(path.join(RESULTS_DIR, localFileName), upscaledBuffer);
+
+    const runtimeMs = Date.now() - startTime;
+    const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
+
+    let actualCost = null;
+    let costIsEstimate = true;
+    if (result.cost != null) {
+      actualCost = parseFloat(result.cost);
+      costIsEstimate = false;
+    } else if (result.billing?.total != null) {
+      actualCost = parseFloat(result.billing.total);
+      costIsEstimate = false;
+    } else if (result.usage?.cost != null) {
+      actualCost = parseFloat(result.usage.cost);
+      costIsEstimate = false;
+    }
+
+    const finalCost = (!costIsEstimate && actualCost != null) ? actualCost : estimatedCost;
+
+    const newRecord = {
+      id: runId,
+      status: 'done',
+      preset: 'upscale',
+      presetLabel: `2x Upscale (${modelLabel})`,
+      parentRunId,
+      model: modelId,
+      params: { parentRunId, model: modelId, scale: 2 },
+      seed: parentSeed,
+      runtime: runtimeStr,
+      cost: finalCost,
+      costIsEstimate,
+      timestamp: new Date().toISOString(),
+      imageUrl: `/api/lab/results/${localFileName}`,
+      remoteUrl: upscaledUrl,
+      modelResponseUrl: upscaledUrl,
+      dimensions: { width: genW, height: genH },
+      origDimensions: { width: origMeta.width, height: origMeta.height },
+      aspectMismatch,
+      rating: 0,
+      notes: `2x non-generative super-resolution upscale from #${parentRunId}`
+    };
+
+    fs.writeFileSync(path.join(RESULTS_DIR, `${runId}.json`), JSON.stringify(newRecord, null, 2), 'utf8');
+    res.json({ success: true, result: newRecord });
+  } catch (err) {
+    console.error('[LAB UPSCALE ERROR]:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
  * GET /api/lab/export
  * REQUIREMENT 6: Export all runs, images, original photo, report.csv, and report.html in a streamed zip
  */
 router.get('/api/lab/export', labAuthMiddleware, async (req, res) => {
   try {
+    const origMeta = await getOriginalPhotoMetadata();
     const files = fs.readdirSync(RESULTS_DIR).filter(f => f.endsWith('.json'));
-    const runs = files.map(f => {
+    const runs = [];
+    for (const f of files) {
       try {
-        return JSON.parse(fs.readFileSync(path.join(RESULTS_DIR, f), 'utf8'));
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
+        const content = fs.readFileSync(path.join(RESULTS_DIR, f), 'utf8');
+        const parsed = JSON.parse(content);
+        const enriched = await enrichRunRecord(parsed, origMeta);
+        runs.push(enriched);
+      } catch {}
+    }
 
     // Sort by rating descending, then newest
     runs.sort((a, b) => ((b.rating || 0) - (a.rating || 0)) || (new Date(b.timestamp) - new Date(a.timestamp)));
 
     // Generate CSV
     const csvRows = [
-      ['Run ID', 'Status', 'Preset', 'Model', 'Seed', 'Rating', 'Cost ($)', 'Runtime', 'Dimensions', 'Aspect Mismatch', 'Scene Description', 'Outfit', 'Notes', 'Timestamp']
+      ['Run ID', 'Status', 'Preset', 'Model', 'Seed', 'Rating', 'Cost ($)', 'Runtime', 'Dimensions', 'Aspect Mismatch (>3%)', 'Scene Description', 'Outfit', 'Fal Response URL', 'Notes', 'Timestamp']
     ];
 
     runs.forEach(r => {
+      const isEst = r.costIsEstimate !== false;
+      const costStr = r.cost != null ? `${parseFloat(r.cost).toFixed(3)}${isEst ? ' (est.)' : ''}` : '';
+      const dimsStr = (r.dimensions && r.dimensions.width && r.dimensions.height) ? `${r.dimensions.width}x${r.dimensions.height}` : 'N/A';
       csvRows.push([
         r.id,
         r.status || 'done',
@@ -2214,12 +2635,13 @@ router.get('/api/lab/export', labAuthMiddleware, async (req, res) => {
         r.model || '',
         r.seed ?? '',
         r.rating || 0,
-        r.cost != null ? parseFloat(r.cost).toFixed(3) : '',
+        costStr,
         r.runtime || '',
-        r.dimensions ? `${r.dimensions.width}x${r.dimensions.height}` : '',
+        dimsStr,
         r.aspectMismatch ? 'YES' : 'NO',
         r.params?.scene || '',
         r.params?.outfit || '',
+        r.modelResponseUrl || r.remoteUrl || '',
         (r.notes || '').replace(/"/g, '""'),
         r.timestamp || ''
       ]);
@@ -2259,6 +2681,7 @@ router.get('/api/lab/export', labAuthMiddleware, async (req, res) => {
         <th>Cost</th>
         <th>Runtime</th>
         <th>Notes</th>
+        <th>Fal Response URL</th>
       </tr>
     </thead>
     <tbody>
@@ -2269,10 +2692,14 @@ router.get('/api/lab/export', labAuthMiddleware, async (req, res) => {
           <td><strong>${r.presetLabel || r.preset}</strong></td>
           <td><code>${r.model}</code></td>
           <td><span class="star">${r.rating ? '★'.repeat(r.rating) : 'Unrated'}</span></td>
-          <td>${r.dimensions ? `${r.dimensions.width}&times;${r.dimensions.height} px` : 'N/A'}</td>
-          <td style="color:#34d399;">$${parseFloat(r.cost || 0).toFixed(3)}</td>
+          <td>
+            ${(r.dimensions && r.dimensions.width && r.dimensions.height) ? `${r.dimensions.width}&times;${r.dimensions.height} px` : 'N/A'}
+            ${r.aspectMismatch ? '<br><span style="color:#fbbf24;font-size:0.7rem;font-weight:700;">⚠️ Ratio Differs (>3%)</span>' : ''}
+          </td>
+          <td style="color:#34d399;">$${parseFloat(r.cost || 0).toFixed(3)}${r.costIsEstimate !== false ? ' <span style="font-size:0.75rem;color:#a1a1aa;">est.</span>' : ''}</td>
           <td>${r.runtime || 'N/A'}</td>
           <td>${r.notes || '—'}</td>
+          <td>${(r.modelResponseUrl || r.remoteUrl) ? `<a href="${r.modelResponseUrl || r.remoteUrl}" target="_blank" style="color:#f59e0b;font-size:0.75rem;word-break:break-all;">View Fal Media</a>` : '—'}</td>
         </tr>
       `).join('')}
     </tbody>
@@ -2374,13 +2801,50 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
   const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
   let presetLabel = `Preset ${preset}`;
-  if (preset === 'A') presetLabel = 'Preset A (Flux-Pro Kontext)';
-  else if (preset === 'B') presetLabel = 'Preset B (PuLID 0.9)';
-  else if (preset === 'C') presetLabel = 'Preset C (PuLID 0.8 Natural)';
-  else if (preset === 'D') presetLabel = 'Preset D (Kontext + Upscale + Grain)';
-  else if (preset === 'E') presetLabel = 'Preset E (Nano Banana Edit)';
-  else if (preset === 'F') presetLabel = 'Preset F (Seedream Edit)';
-  else if (preset === 'custom') presetLabel = 'Custom Run';
+  let initialModel = 'fal-ai/flux-pulid';
+  let initialCost = 0.035;
+
+  if (preset === 'A') {
+    presetLabel = 'Preset A (Flux-Pro Kontext)';
+    initialModel = 'fal-ai/flux-pro/kontext';
+    initialCost = MODEL_PRICING['fal-ai/flux-pro/kontext'];
+  } else if (preset === 'B') {
+    presetLabel = 'Preset B (PuLID 0.9)';
+    initialModel = 'fal-ai/flux-pulid';
+    initialCost = MODEL_PRICING['fal-ai/flux-pulid'];
+  } else if (preset === 'C') {
+    presetLabel = 'Preset C (PuLID 0.8 Natural)';
+    initialModel = 'fal-ai/flux-pulid';
+    initialCost = MODEL_PRICING['fal-ai/flux-pulid'];
+  } else if (preset === 'D') {
+    presetLabel = 'Preset D (Kontext + Upscale + Grain)';
+    initialModel = 'fal-ai/flux-pro/kontext';
+    initialCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
+  } else if (preset === 'E') {
+    presetLabel = 'Preset E (Nano Banana Edit)';
+    initialModel = 'fal-ai/nano-banana/edit';
+    initialCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
+  } else if (preset === 'E2') {
+    presetLabel = 'Preset E2 (Nano Banana Desk-Preserve)';
+    initialModel = 'fal-ai/nano-banana/edit';
+    initialCost = MODEL_PRICING['fal-ai/nano-banana/edit'];
+  } else if (preset === 'F') {
+    presetLabel = 'Preset F (Seedream Edit)';
+    initialModel = 'fal-ai/bytedance/seedream/v4.5/edit';
+    initialCost = MODEL_PRICING['fal-ai/bytedance/seedream/v4.5/edit'];
+  } else if (preset === 'G') {
+    presetLabel = 'Preset G (Nano Banana 2 Edit, 2K)';
+    initialModel = 'fal-ai/nano-banana-2/edit';
+    initialCost = MODEL_PRICING['fal-ai/nano-banana-2/edit'];
+  } else if (preset === 'H') {
+    presetLabel = 'Preset H (Nano Banana Pro Edit, 2K)';
+    initialModel = 'fal-ai/gemini-3-pro-image-preview/edit';
+    initialCost = MODEL_PRICING['fal-ai/gemini-3-pro-image-preview/edit'];
+  } else if (preset === 'custom') {
+    presetLabel = 'Custom Run';
+    initialModel = customConfig?.model || 'fal-ai/flux-pulid';
+    initialCost = MODEL_PRICING[initialModel] || 0.035;
+  }
 
   const origMeta = await getOriginalPhotoMetadata();
 
@@ -2389,18 +2853,16 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     status: 'queued',
     preset,
     presetLabel,
-    model: preset === 'A' || preset === 'D' ? 'fal-ai/flux-pro/kontext'
-      : preset === 'E' ? 'fal-ai/nano-banana/edit'
-      : preset === 'F' ? 'fal-ai/bytedance/seedream/v4.5/edit'
-      : preset === 'custom' ? (customConfig?.model || 'fal-ai/flux-pulid')
-      : 'fal-ai/flux-pulid',
+    model: initialModel,
     params: { preset, mode, scene, outfit, outputSize, seed: numSeed },
     seed: numSeed,
     runtime: '0.0s',
-    cost: MODEL_PRICING[preset === 'A' || preset === 'D' ? 'fal-ai/flux-pro/kontext' : 'fal-ai/flux-pulid'] || 0.035,
+    cost: initialCost,
+    costIsEstimate: true,
     timestamp: new Date().toISOString(),
     imageUrl: null,
     remoteUrl: null,
+    modelResponseUrl: null,
     dimensions: null,
     origDimensions: { width: origMeta.width, height: origMeta.height },
     aspectMismatch: false,
