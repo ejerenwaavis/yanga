@@ -5,6 +5,13 @@ import {
   buildV2Prompt, 
   CLOTHING_REGEX 
 } from './data/studioPresets.js';
+import {
+  BUILD_STEPS,
+  BUILD_CONFLICTS,
+  detectBuildConflicts,
+  composeBuildInstruction,
+  presetToBuildSelections
+} from './data/buildSteps.js';
 
 /**
  * REQUIREMENT 5: User Display Name Priority
@@ -45,6 +52,44 @@ function getLineageText(item) {
   return 'Version 1 (Initial)';
 }
 
+function getSelectedChips(selections = {}, keepLocks = {}) {
+  const chips = [];
+  for (const step of BUILD_STEPS) {
+    if (step.requiresUnlocked && keepLocks && keepLocks[step.requiresUnlocked]) {
+      continue;
+    }
+    const val = selections[step.id];
+    if (val === undefined || val === null) continue;
+    if (step.selectMode === 'multi') {
+      const ids = Array.isArray(val) ? val : [val];
+      for (const id of ids) {
+        const opt = step.options.find((o) => o.id === id);
+        if (opt) {
+          chips.push({
+            stepId: step.id,
+            stepTitle: step.title,
+            optionId: opt.id,
+            label: opt.label,
+            key: `${step.id}_${opt.id}`
+          });
+        }
+      }
+    } else {
+      const opt = step.options.find((o) => o.id === val);
+      if (opt) {
+        chips.push({
+          stepId: step.id,
+          stepTitle: step.title,
+          optionId: opt.id,
+          label: opt.label,
+          key: `${step.id}_${opt.id}`
+        });
+      }
+    }
+  }
+  return chips;
+}
+
 export default function App() {
   // ─── Authentication & SSO State ───────────────────────────────────────────
   const [authChecking, setAuthChecking] = useState(true);
@@ -66,22 +111,26 @@ export default function App() {
   const [mfaToken, setMfaToken] = useState('');
   const [otp, setOtp] = useState('');
 
-  // ─── Studio Configuration State (Pipeline v2 Composable UI) ───────────────
+  // ─── Creation Mode State: "Quick Presets" | "Build" ────────────────────────
+  const [creationMode, setCreationMode] = useState('presets'); // 'presets' | 'build'
+
   // Step 1: Reference Photo
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
 
-  // Step 2: Single Source of Truth Instruction Textarea
-  // REQUIREMENT 1: On first load nothing is selected, the textarea is empty, placeholder suggests an example
+  // ─── Quick Presets Mode State ─────────────────────────────────────────────
   const [instruction, setInstruction] = useState('');
   const [highlightedSceneId, setHighlightedSceneId] = useState(null);
+  const [activeCategory, setActiveCategory] = useState('all');
+
+  // ─── Build Mode State (Guided Flow) ───────────────────────────────────────
+  const [currentBuildStep, setCurrentBuildStep] = useState(0); // 0 to BUILD_STEPS.length (Review is last)
+  const [buildSelections, setBuildSelections] = useState({});
+  const [freeText, setFreeText] = useState('');
 
   // Lock Toggles (Defaults: Outfit ON, Pose ON, Hair ON, Props ON, Background OFF)
   const [locks, setLocks] = useState(DEFAULT_LOCKS);
-
   const [showPromptPreview, setShowPromptPreview] = useState(false);
-  // Category tabs get an "All" option (default: 'all')
-  const [activeCategory, setActiveCategory] = useState('all');
 
   // Generation & Polling State
   const [loading, setLoading] = useState(false);
@@ -90,20 +139,20 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [activeResult, setActiveResult] = useState(null);
 
-  // ─── Full-Screen Viewer State (REQUIREMENT 3) ─────────────────────────────
+  // Full-Screen Viewer State
   const [viewerItem, setViewerItem] = useState(null);
   const [viewerMode, setViewerMode] = useState('result'); // 'result' | 'original'
 
-  // ─── Edit Sheet State (REQUIREMENT 3) ──────────────────────────────────────
+  // Edit Sheet State
   const [editingItem, setEditingItem] = useState(null);
   const [editBaseChoice, setEditBaseChoice] = useState('result'); // 'result' | 'original'
   const [editInstruction, setEditInstruction] = useState('');
   const [editLocks, setEditLocks] = useState(DEFAULT_LOCKS);
 
-  // ─── Gallery Card Toggle State: Result | Original (REQUIREMENT 2) ──────────
+  // Gallery Card Toggle State: Result | Original
   const [cardViewMap, setCardViewMap] = useState({}); // { [id]: 'result' | 'original' }
 
-  // ─── Multi-Select & Zip Download State (REQUIREMENT 4) ────────────────────
+  // Multi-Select & Zip Download State
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [includeOriginalsZip, setIncludeOriginalsZip] = useState(false);
   const [downloadingZip, setDownloadingZip] = useState(false);
@@ -277,14 +326,7 @@ export default function App() {
     }
   };
 
-  // ─── Scene & Instruction Handlers (REQUIREMENT 1) ─────────────────────────
-  /**
-   * REQUIREMENT 1:
-   * Tapping a selected scene card again deselects it.
-   * If the textarea still equals that card's starter text, clear it too.
-   * If the user edited the text, keep their text.
-   * Selecting a scene card turns Keep my background OFF automatically.
-   */
+  // ─── Presets Scene & Instruction Handlers ─────────────────────────────────
   const handleSelectScene = (scene) => {
     if (highlightedSceneId === scene.id) {
       setHighlightedSceneId(null);
@@ -299,7 +341,6 @@ export default function App() {
     setError(null);
   };
 
-  // If the user edits the text, remove the card highlight
   const handleInstructionChange = (e) => {
     const text = e.target.value;
     setInstruction(text);
@@ -308,16 +349,60 @@ export default function App() {
     setError(null);
   };
 
-  /**
-   * REQUIREMENT 1:
-   * "Clear" button beside textarea.
-   * Clears text, deselects scene card and category tab, and resets locks to defaults.
-   */
   const handleClearComposer = () => {
     setInstruction('');
     setHighlightedSceneId(null);
     setActiveCategory('all');
     setLocks({ ...DEFAULT_LOCKS });
+    setError(null);
+  };
+
+  // ─── Guided Build Flow Handlers ───────────────────────────────────────────
+  const handleToggleBuildOption = (step, optionId) => {
+    setBuildSelections((prev) => {
+      const next = { ...prev };
+      if (step.selectMode === 'multi') {
+        const currentList = Array.isArray(next[step.id]) ? [...next[step.id]] : [];
+        const idx = currentList.indexOf(optionId);
+        if (idx >= 0) {
+          currentList.splice(idx, 1);
+        } else {
+          currentList.push(optionId);
+        }
+        next[step.id] = currentList;
+      } else {
+        // Single-select toggle: tapping the selected one deselects it
+        if (next[step.id] === optionId) {
+          delete next[step.id];
+        } else {
+          next[step.id] = optionId;
+        }
+      }
+      return next;
+    });
+  };
+
+  const handleRemoveChip = (stepId, optionId) => {
+    setBuildSelections((prev) => {
+      const next = { ...prev };
+      const step = BUILD_STEPS.find((s) => s.id === stepId);
+      if (!step) return prev;
+      if (step.selectMode === 'multi') {
+        const currentList = Array.isArray(next[stepId]) ? next[stepId].filter((id) => id !== optionId) : [];
+        next[stepId] = currentList;
+      } else {
+        delete next[stepId];
+      }
+      return next;
+    });
+  };
+
+  // ─── Preset to Build Bridge ───────────────────────────────────────────────
+  const handleCustomizeInBuild = (scene) => {
+    const selections = presetToBuildSelections(scene);
+    setBuildSelections(selections);
+    setCreationMode('build');
+    setCurrentBuildStep(BUILD_STEPS.length); // Open on Review screen to see pre-filled build
     setError(null);
   };
 
@@ -336,11 +421,20 @@ export default function App() {
 
   const activeHighlightedScene = SCENES.find((s) => s.id === highlightedSceneId);
 
-  // Exact Canonical Prompt Preview
-  const exactFinalPrompt = buildV2Prompt(instruction, locks);
+  // Dynamic Prompt & Conflict Detection for active mode
+  const activeInstruction = creationMode === 'build'
+    ? composeBuildInstruction(buildSelections, freeText, locks)
+    : instruction;
 
-  // Clothing mention check
-  const clothingMentioned = locks.outfit && CLOTHING_REGEX.test(instruction);
+  const exactFinalPrompt = buildV2Prompt(activeInstruction, locks);
+
+  // Conflict evaluation
+  const buildConflicts = creationMode === 'build' ? detectBuildConflicts(buildSelections) : [];
+  const clothingMentioned = creationMode === 'build'
+    ? (locks.outfit && CLOTHING_REGEX.test(freeText))
+    : (locks.outfit && CLOTHING_REGEX.test(instruction));
+
+  const selectedChips = getSelectedChips(buildSelections, locks);
 
   // ─── Download Helper ──────────────────────────────────────────────────────
   const handleDownload = async (imageUrl, title) => {
@@ -361,8 +455,8 @@ export default function App() {
     }
   };
 
-  // ─── Generation Completion Handler (REQUIREMENT 2) ────────────────────────
-  const handleGenerationSuccess = (resultData) => {
+  // ─── Generation Completion Handler ────────────────────────────────────────
+  const handleGenerationSuccess = (resultData, generatedTitle) => {
     const newResult = {
       id: resultData.jobId || Date.now().toString(),
       jobId: resultData.jobId || Date.now().toString(),
@@ -372,8 +466,8 @@ export default function App() {
       parentId: resultData.parentId || null,
       baseUsed: resultData.baseUsed || 'original',
       version: resultData.version || 1,
-      sceneTitle: activeHighlightedScene?.title || 'Custom Photoshoot',
-      instruction: resultData.instruction || instruction,
+      sceneTitle: generatedTitle || activeHighlightedScene?.title || 'Custom Photoshoot',
+      instruction: resultData.instruction || activeInstruction,
       prompt: resultData.prompt || exactFinalPrompt,
       locks: resultData.locks || locks,
       width: resultData.width,
@@ -395,12 +489,11 @@ export default function App() {
   };
 
   // ─── Poll Job Status ──────────────────────────────────────────────────────
-  const pollJobStatus = (jobId) => {
+  const pollJobStatus = (jobId, generatedTitle) => {
     const startTime = Date.now();
     if (pollTimerRef.current) clearInterval(pollTimerRef.current);
 
     pollTimerRef.current = setInterval(async () => {
-      // 180s client timeout guard
       if (Date.now() - startTime > 190000) {
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -416,7 +509,7 @@ export default function App() {
         if (data.status === 'done' && data.result) {
           clearInterval(pollTimerRef.current);
           pollTimerRef.current = null;
-          handleGenerationSuccess(data.result);
+          handleGenerationSuccess(data.result, generatedTitle);
           setLoading(false);
         } else if (data.status === 'error') {
           clearInterval(pollTimerRef.current);
@@ -448,9 +541,14 @@ export default function App() {
       return;
     }
 
-    const cleanInstruction = instruction.trim();
+    const cleanInstruction = creationMode === 'build'
+      ? composeBuildInstruction(buildSelections, freeText, locks)
+      : instruction.trim();
+
     if (!cleanInstruction) {
-      setError('Describe the scene or change you want.');
+      setError(creationMode === 'build'
+        ? 'Select at least one build option or enter custom detail.'
+        : 'Describe the scene or change you want.');
       return;
     }
 
@@ -458,12 +556,23 @@ export default function App() {
     setLoadingStage('Queuing photoshoot...');
     setError(null);
 
+    const generatedTitle = creationMode === 'build'
+      ? [
+          BUILD_STEPS.find(s => s.id === 'setting')?.options.find(o => o.id === buildSelections.setting)?.label,
+          BUILD_STEPS.find(s => s.id === 'occasion')?.options.find(o => o.id === buildSelections.occasion)?.label
+        ].filter(Boolean).join(' • ') || 'Custom Build Photoshoot'
+      : activeHighlightedScene?.title || 'Custom Photoshoot';
+
     const formData = new FormData();
     formData.append('image', file);
     formData.append('instruction', cleanInstruction);
     formData.append('locks', JSON.stringify(locks));
-    if (activeHighlightedScene?.id) {
+
+    if (creationMode === 'presets' && activeHighlightedScene?.id) {
       formData.append('sceneSlug', activeHighlightedScene.id);
+    } else if (creationMode === 'build') {
+      const buildSlug = buildSelections.setting || buildSelections.occasion || 'build';
+      formData.append('sceneSlug', buildSlug);
     }
 
     try {
@@ -495,13 +604,13 @@ export default function App() {
       }
 
       if (data.imageUrl) {
-        handleGenerationSuccess(data);
+        handleGenerationSuccess(data, generatedTitle);
         setLoading(false);
         return;
       }
 
       if (data.jobId) {
-        pollJobStatus(data.jobId);
+        pollJobStatus(data.jobId, generatedTitle);
       } else {
         setError('Unexpected server response: missing job tracking ID.');
         setLoading(false);
@@ -513,7 +622,7 @@ export default function App() {
     }
   };
 
-  // ─── Submit Edit Request (REQUIREMENT 3) ──────────────────────────────────
+  // ─── Submit Edit Request ──────────────────────────────────────────────────
   const handleEditSubmit = async (e) => {
     if (e) e.preventDefault();
     if (!editingItem) return;
@@ -534,7 +643,6 @@ export default function App() {
       formData.append('image', file);
     }
 
-    // Close edit sheet
     setEditingItem(null);
     setViewerItem(null);
     setLoading(true);
@@ -564,9 +672,9 @@ export default function App() {
       }
 
       if (data.jobId) {
-        pollJobStatus(data.jobId);
+        pollJobStatus(data.jobId, editingItem.sceneTitle);
       } else if (data.imageUrl) {
-        handleGenerationSuccess(data);
+        handleGenerationSuccess(data, editingItem.sceneTitle);
         setLoading(false);
       }
     } catch (err) {
@@ -576,7 +684,7 @@ export default function App() {
     }
   };
 
-  // ─── Delete Actions (REQUIREMENT 3) ───────────────────────────────────────
+  // ─── Delete Actions ───────────────────────────────────────────────────────
   const handleDeleteSinglePhoto = async (item) => {
     const jobId = item.jobId || item.id;
     if (!confirm('Are you sure you want to delete this photoshoot from the server?')) {
@@ -646,8 +754,7 @@ export default function App() {
     }
   };
 
-  // ─── Multi-Select & Batch Zip Download (REQUIREMENT 4) ────────────────────
-  // Combine session results and history into one unified list without duplicates
+  // ─── Multi-Select & Batch Zip Download ────────────────────────────────────
   const allPhotosMap = new Map();
   results.forEach((r) => allPhotosMap.set(r.jobId || r.id, r));
   history.forEach((h) => {
@@ -895,7 +1002,7 @@ export default function App() {
   // ─── AUTHENTICATED STUDIO VIEW ───────────────────────────────────────────
   return (
     <div className="min-h-screen bg-neutral-950 text-neutral-100 p-4 md:p-8 flex flex-col items-center">
-      {/* REQUIREMENT 5: Top Bar / Member Banner showing User's Real Name */}
+      {/* Top Bar / Member Banner showing User's Real Name */}
       <div className="w-full max-w-5xl flex items-center justify-between py-2 px-4 mb-6 rounded-xl bg-neutral-900/60 border border-neutral-800 text-xs">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
@@ -932,7 +1039,7 @@ export default function App() {
       {/* Main Studio Workspace */}
       <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         {/* Left Column: Studio Controls (7 cols) */}
-        <form onSubmit={handleSubmit} className="lg:col-span-7 bg-neutral-900/90 border border-neutral-800 rounded-2xl p-5 md:p-7 shadow-2xl flex flex-col gap-6">
+        <form onSubmit={handleSubmit} className="lg:col-span-7 bg-neutral-900/90 border border-neutral-800 rounded-2xl p-5 md:p-7 shadow-2xl flex flex-col gap-5">
           
           {/* ─── STEP 1: Reference Photo Dropzone ─────────────────────── */}
           <div>
@@ -952,7 +1059,6 @@ export default function App() {
               {previewUrl ? (
                 <div className="relative group rounded-lg overflow-hidden flex items-center justify-center bg-black/40">
                   <img src={previewUrl} alt="Reference Preview" className="h-44 object-contain rounded-lg" />
-                  {/* REQUIREMENT 2: Original label on reference thumbnail */}
                   <span className="absolute top-2 left-2 bg-black/80 text-amber-400 border border-amber-500/40 text-[10px] font-bold px-2 py-0.5 rounded shadow">
                     Original
                   </span>
@@ -972,230 +1078,702 @@ export default function App() {
             </div>
           </div>
 
-          {/* ─── STEP 2: Describe Your Photo (Single Source of Truth) ───── */}
-          <div className="border-t border-neutral-800 pt-5">
-            <div className="flex items-center justify-between mb-2">
-              <label htmlFor="instructionField" className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
-                <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">2</span>
-                <span>Describe your photo</span>
-              </label>
-              <div className="flex items-center gap-2">
-                {/* REQUIREMENT 1: Clear button beside textarea */}
-                <button
-                  type="button"
-                  onClick={handleClearComposer}
-                  className="text-[11px] text-neutral-400 hover:text-amber-400 border border-neutral-800 hover:border-neutral-700 bg-neutral-950/60 px-2.5 py-0.5 rounded-md transition-colors"
-                  title="Clear text, deselect scene card, reset category tab, and restore default locks"
-                >
-                  Clear
-                </button>
-                <span className="text-[10px] text-neutral-500 hidden sm:inline">Single source of truth</span>
-              </div>
-            </div>
-
-            {/* Editable Textarea: Instruction */}
-            {/* REQUIREMENT 1: Placeholder suggests an example */}
-            <textarea
-              id="instructionField"
-              value={instruction}
-              onChange={handleInstructionChange}
-              rows={3}
-              placeholder="e.g. Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows."
-              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 text-xs p-3.5 rounded-xl outline-none focus:border-amber-500 transition-colors leading-relaxed resize-y"
-            />
-
-            {/* Clothing mention check */}
-            {clothingMentioned && (
-              <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-2 mt-2">
-                <span className="flex items-center gap-1.5">
-                  <span>💡</span>
-                  <span>You described an outfit. Turn off Keep my outfit to change it.</span>
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setLocks((prev) => ({ ...prev, outfit: false }))}
-                  className="text-[11px] font-bold bg-amber-500 text-neutral-950 px-2 py-0.5 rounded hover:bg-amber-400 whitespace-nowrap transition-colors"
-                >
-                  Turn Off
-                </button>
-              </div>
-            )}
-
-            {/* REQUIREMENT 4: Lock Toggles under the textarea */}
-            <div className="mt-4 pt-3 border-t border-neutral-800/80">
-              <div className="flex items-center justify-between mb-2.5 flex-wrap gap-1">
-                <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
-                  Keep Rules & Locks
-                </span>
-                <span className="text-[10px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded flex items-center gap-1">
-                  🔒 Face is always locked
-                </span>
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                {/* Lock 1: Outfit */}
-                <button
-                  type="button"
-                  onClick={() => toggleLock('outfit')}
-                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
-                    locks.outfit
-                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
-                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
-                  }`}
-                >
-                  <span className="text-[11px] font-medium">Keep my outfit</span>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.outfit ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
-                    {locks.outfit ? 'ON' : 'OFF'}
-                  </span>
-                </button>
-
-                {/* Lock 2: Pose */}
-                <button
-                  type="button"
-                  onClick={() => toggleLock('pose')}
-                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
-                    locks.pose
-                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
-                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
-                  }`}
-                >
-                  <span className="text-[11px] font-medium">Keep my pose</span>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.pose ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
-                    {locks.pose ? 'ON' : 'OFF'}
-                  </span>
-                </button>
-
-                {/* Lock 3: Hair */}
-                <button
-                  type="button"
-                  onClick={() => toggleLock('hair')}
-                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
-                    locks.hair
-                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
-                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
-                  }`}
-                >
-                  <span className="text-[11px] font-medium">Keep my hair</span>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.hair ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
-                    {locks.hair ? 'ON' : 'OFF'}
-                  </span>
-                </button>
-
-                {/* Lock 4: Props and objects */}
-                <button
-                  type="button"
-                  onClick={() => toggleLock('props')}
-                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
-                    locks.props
-                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
-                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
-                  }`}
-                >
-                  <span className="text-[11px] font-medium">Keep props/objects</span>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.props ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
-                    {locks.props ? 'ON' : 'OFF'}
-                  </span>
-                </button>
-
-                {/* Lock 5: Background */}
-                <button
-                  type="button"
-                  onClick={() => toggleLock('background')}
-                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
-                    locks.background
-                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
-                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
-                  }`}
-                >
-                  <span className="text-[11px] font-medium">Keep background</span>
-                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.background ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
-                    {locks.background ? 'ON' : 'OFF'}
-                  </span>
-                </button>
-              </div>
-            </div>
-
-            {/* Collapsed Prompt Preview */}
-            <div className="mt-3.5">
+          {/* ─── CREATION MODE SWITCH: Quick Presets | Build ──────────── */}
+          <div className="pt-2">
+            <div className="flex items-center p-1 bg-neutral-950 border border-neutral-800 rounded-xl">
               <button
                 type="button"
-                onClick={() => setShowPromptPreview(!showPromptPreview)}
-                className="text-[11px] text-neutral-400 hover:text-amber-400 flex items-center gap-1 transition-colors"
+                onClick={() => setCreationMode('presets')}
+                className={`flex-1 py-2 px-3 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                  creationMode === 'presets'
+                    ? 'bg-amber-500 text-neutral-950 shadow-sm'
+                    : 'text-neutral-400 hover:text-white'
+                }`}
               >
-                <span>{showPromptPreview ? '▾ Hide' : '▸ Preview'} exact final prompt</span>
+                <span>⚡ Quick Presets</span>
               </button>
-
-              {showPromptPreview && (
-                <div className="mt-2 p-3 rounded-xl bg-black/80 border border-neutral-800 font-mono text-[11px] text-amber-200/90 leading-relaxed break-words shadow-inner">
-                  {exactFinalPrompt}
-                </div>
-              )}
+              <button
+                type="button"
+                onClick={() => setCreationMode('build')}
+                className={`flex-1 py-2 px-3 text-xs font-bold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                  creationMode === 'build'
+                    ? 'bg-amber-500 text-neutral-950 shadow-sm'
+                    : 'text-neutral-400 hover:text-white'
+                }`}
+              >
+                <span>🛠️ Build Mode</span>
+                {selectedChips.length > 0 && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-neutral-900 text-amber-300 border border-amber-500/30">
+                    {selectedChips.length}
+                  </span>
+                )}
+              </button>
             </div>
           </div>
 
-          {/* ─── STEP 3: Scene Inspiration (Tap to load starter text) ──── */}
-          <div className="border-t border-neutral-800 pt-5">
-            <div className="flex items-center justify-between mb-3">
-              <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
-                <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">3</span>
-                <span>Scene Inspiration (Tap to fill instruction)</span>
-              </label>
-              {highlightedSceneId && (
-                <span className="text-[10px] text-amber-400 font-semibold">
-                  Card selected ✓ (Tap again to deselect)
-                </span>
-              )}
-            </div>
+          {/* ═══════════════════════════════════════════════════════════════ */}
+          {/* VIEW A: QUICK PRESETS MODE                                      */}
+          {/* ═══════════════════════════════════════════════════════════════ */}
+          {creationMode === 'presets' && (
+            <>
+              {/* STEP 2: Describe Your Photo (Single Source of Truth) */}
+              <div className="border-t border-neutral-800 pt-4">
+                <div className="flex items-center justify-between mb-2">
+                  <label htmlFor="instructionField" className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
+                    <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">2</span>
+                    <span>Describe your photo</span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleClearComposer}
+                      className="text-[11px] text-neutral-400 hover:text-amber-400 border border-neutral-800 hover:border-neutral-700 bg-neutral-950/60 px-2.5 py-0.5 rounded-md transition-colors"
+                      title="Clear text, deselect scene card, reset category tab, and restore default locks"
+                    >
+                      Clear
+                    </button>
+                    <span className="text-[10px] text-neutral-500 hidden sm:inline">Single source of truth</span>
+                  </div>
+                </div>
 
-            {/* Category Tabs with "All" Option */}
-            <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
-              {SCENE_CATEGORIES.map((c) => (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => setActiveCategory(c.id)}
-                  className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${
-                    activeCategory === c.id
-                      ? 'bg-amber-500 text-neutral-950 font-bold'
-                      : 'bg-neutral-950 text-neutral-400 border border-neutral-800 hover:text-white'
-                  }`}
-                >
-                  {c.label}
-                </button>
-              ))}
-            </div>
+                <textarea
+                  id="instructionField"
+                  value={instruction}
+                  onChange={handleInstructionChange}
+                  rows={3}
+                  placeholder="e.g. Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows."
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 text-xs p-3.5 rounded-xl outline-none focus:border-amber-500 transition-colors leading-relaxed resize-y"
+                />
 
-            {/* Filtered Scene Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 mt-3">
-              {filteredScenes.map((s) => {
-                const isHighlighted = highlightedSceneId === s.id;
-                return (
+                {/* Clothing mention check */}
+                {clothingMentioned && (
+                  <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-2 mt-2">
+                    <span className="flex items-center gap-1.5">
+                      <span>💡</span>
+                      <span>You described an outfit. Turn off Keep my outfit to change it.</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setLocks((prev) => ({ ...prev, outfit: false }))}
+                      className="text-[11px] font-bold bg-amber-500 text-neutral-950 px-2 py-0.5 rounded hover:bg-amber-400 whitespace-nowrap transition-colors"
+                    >
+                      Turn Off
+                    </button>
+                  </div>
+                )}
+
+                {/* Keep Rules & Locks Panel */}
+                <div className="mt-4 pt-3 border-t border-neutral-800/80">
+                  <div className="flex items-center justify-between mb-2.5 flex-wrap gap-1">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
+                      Keep Rules & Locks
+                    </span>
+                    <span className="text-[10px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded flex items-center gap-1">
+                      🔒 Face is always locked
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {/* Lock 1: Outfit */}
+                    <button
+                      type="button"
+                      onClick={() => toggleLock('outfit')}
+                      className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                        locks.outfit
+                          ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                      }`}
+                    >
+                      <span className="text-[11px] font-medium">Keep my outfit</span>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.outfit ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                        {locks.outfit ? 'ON' : 'OFF'}
+                      </span>
+                    </button>
+
+                    {/* Lock 2: Pose */}
+                    <button
+                      type="button"
+                      onClick={() => toggleLock('pose')}
+                      className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                        locks.pose
+                          ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                      }`}
+                    >
+                      <span className="text-[11px] font-medium">Keep my pose</span>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.pose ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                        {locks.pose ? 'ON' : 'OFF'}
+                      </span>
+                    </button>
+
+                    {/* Lock 3: Hair */}
+                    <button
+                      type="button"
+                      onClick={() => toggleLock('hair')}
+                      className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                        locks.hair
+                          ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                      }`}
+                    >
+                      <span className="text-[11px] font-medium">Keep my hair</span>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.hair ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                        {locks.hair ? 'ON' : 'OFF'}
+                      </span>
+                    </button>
+
+                    {/* Lock 4: Props and objects */}
+                    <button
+                      type="button"
+                      onClick={() => toggleLock('props')}
+                      className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                        locks.props
+                          ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                      }`}
+                    >
+                      <span className="text-[11px] font-medium">Keep props/objects</span>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.props ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                        {locks.props ? 'ON' : 'OFF'}
+                      </span>
+                    </button>
+
+                    {/* Lock 5: Background */}
+                    <button
+                      type="button"
+                      onClick={() => toggleLock('background')}
+                      className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                        locks.background
+                          ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                          : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                      }`}
+                    >
+                      <span className="text-[11px] font-medium">Keep background</span>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.background ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                        {locks.background ? 'ON' : 'OFF'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Collapsed Prompt Preview */}
+                <div className="mt-3.5">
                   <button
-                    key={s.id}
                     type="button"
-                    onClick={() => handleSelectScene(s)}
-                    className={`text-left p-3 rounded-xl border text-xs transition-all flex flex-col justify-between ${
-                      isHighlighted
-                        ? 'border-amber-500 bg-amber-500/15 text-white shadow-sm ring-1 ring-amber-500/40'
-                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                    onClick={() => setShowPromptPreview(!showPromptPreview)}
+                    className="text-[11px] text-neutral-400 hover:text-amber-400 flex items-center gap-1 transition-colors"
+                  >
+                    <span>{showPromptPreview ? '▾ Hide' : '▸ Preview'} exact final prompt</span>
+                  </button>
+
+                  {showPromptPreview && (
+                    <div className="mt-2 p-3 rounded-xl bg-black/80 border border-neutral-800 font-mono text-[11px] text-amber-200/90 leading-relaxed break-words shadow-inner">
+                      {exactFinalPrompt}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* STEP 3: Scene Inspiration (Preset Cards with Bridge to Build) */}
+              <div className="border-t border-neutral-800 pt-4">
+                <div className="flex items-center justify-between mb-3">
+                  <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
+                    <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">3</span>
+                    <span>Scene Inspiration (Tap to load starter)</span>
+                  </label>
+                  {highlightedSceneId && (
+                    <span className="text-[10px] text-amber-400 font-semibold">
+                      Card selected ✓ (Tap again to deselect)
+                    </span>
+                  )}
+                </div>
+
+                {/* Category Tabs with "All" Option */}
+                <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
+                  {SCENE_CATEGORIES.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => setActiveCategory(c.id)}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${
+                        activeCategory === c.id
+                          ? 'bg-amber-500 text-neutral-950 font-bold'
+                          : 'bg-neutral-950 text-neutral-400 border border-neutral-800 hover:text-white'
+                      }`}
+                    >
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Filtered Scene Cards with "Customize in Build" button */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 mt-3">
+                  {filteredScenes.map((s) => {
+                    const isHighlighted = highlightedSceneId === s.id;
+                    return (
+                      <div
+                        key={s.id}
+                        onClick={() => handleSelectScene(s)}
+                        className={`text-left p-3 rounded-xl border text-xs transition-all flex flex-col justify-between cursor-pointer ${
+                          isHighlighted
+                            ? 'border-amber-500 bg-amber-500/15 text-white shadow-sm ring-1 ring-amber-500/40'
+                            : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                        }`}
+                      >
+                        <div>
+                          <div className={isHighlighted ? 'text-amber-400 font-bold' : 'text-neutral-200 font-medium'}>
+                            {s.title}
+                          </div>
+                          <div className="text-[11px] text-neutral-500 mt-1 line-clamp-2">
+                            {s.subtitle}
+                          </div>
+                        </div>
+
+                        {/* Bridge to Build mode */}
+                        {isHighlighted && (
+                          <div className="flex items-center justify-between gap-1 mt-2.5 pt-2 border-t border-amber-500/20">
+                            <span className="text-[10px] text-amber-400 font-bold">Active ✓</span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleCustomizeInBuild(s);
+                              }}
+                              className="text-[10px] font-bold text-neutral-950 bg-amber-500 hover:bg-amber-400 px-2.5 py-1 rounded-md transition-colors shadow flex items-center gap-1"
+                              title="Customize these settings step-by-step in Build mode"
+                            >
+                              <span>Customize in Build</span>
+                              <span>🛠️</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* ═══════════════════════════════════════════════════════════════ */}
+          {/* VIEW B: GUIDED BUILD MODE                                       */}
+          {/* ═══════════════════════════════════════════════════════════════ */}
+          {creationMode === 'build' && (
+            <div className="border-t border-neutral-800 pt-4 flex flex-col gap-4">
+              
+              {/* Keep Rules & Locks Panel (Intact in Build mode) */}
+              <div className="p-3 bg-neutral-950/70 border border-neutral-800/80 rounded-xl">
+                <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
+                    Keep Rules & Locks
+                  </span>
+                  <span className="text-[10px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded flex items-center gap-1">
+                    🔒 Face always locked
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => toggleLock('outfit')}
+                    className={`p-1.5 rounded-lg text-center border text-[11px] font-semibold transition-all ${
+                      locks.outfit
+                        ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
                     }`}
                   >
+                    Outfit: {locks.outfit ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => toggleLock('pose')}
+                    className={`p-1.5 rounded-lg text-center border text-[11px] font-semibold transition-all ${
+                      locks.pose
+                        ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                    }`}
+                  >
+                    Pose: {locks.pose ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => toggleLock('hair')}
+                    className={`p-1.5 rounded-lg text-center border text-[11px] font-semibold transition-all ${
+                      locks.hair
+                        ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                    }`}
+                  >
+                    Hair: {locks.hair ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => toggleLock('props')}
+                    className={`p-1.5 rounded-lg text-center border text-[11px] font-semibold transition-all ${
+                      locks.props
+                        ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                    }`}
+                  >
+                    Props: {locks.props ? 'ON' : 'OFF'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => toggleLock('background')}
+                    className={`p-1.5 rounded-lg text-center border text-[11px] font-semibold transition-all ${
+                      locks.background
+                        ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-500'
+                    }`}
+                  >
+                    Bg: {locks.background ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              </div>
+
+              {/* Progress Dots Navigation */}
+              <div className="flex items-center justify-between pb-1 border-b border-neutral-800/80">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {BUILD_STEPS.map((step, idx) => {
+                    const isCurrent = currentBuildStep === idx;
+                    const isAnswered = Boolean(
+                      Array.isArray(buildSelections[step.id]) 
+                        ? buildSelections[step.id].length > 0 
+                        : buildSelections[step.id]
+                    );
+                    return (
+                      <button
+                        key={step.id}
+                        type="button"
+                        onClick={() => setCurrentBuildStep(idx)}
+                        className={`h-2.5 rounded-full transition-all ${
+                          isCurrent
+                            ? 'w-7 bg-amber-500'
+                            : isAnswered
+                            ? 'w-2.5 bg-amber-500/60 hover:bg-amber-400'
+                            : 'w-2.5 bg-neutral-800 hover:bg-neutral-700'
+                        }`}
+                        title={`${idx + 1}. ${step.title}`}
+                      />
+                    );
+                  })}
+                  {/* Review Screen Dot */}
+                  <button
+                    type="button"
+                    onClick={() => setCurrentBuildStep(BUILD_STEPS.length)}
+                    className={`h-2.5 rounded-full transition-all ${
+                      currentBuildStep === BUILD_STEPS.length
+                        ? 'w-7 bg-amber-500'
+                        : 'w-2.5 bg-neutral-700 hover:bg-neutral-600'
+                    }`}
+                    title="Review & Generate"
+                  />
+                </div>
+                <span className="text-[11px] font-mono text-neutral-400">
+                  {currentBuildStep < BUILD_STEPS.length
+                    ? `Step ${currentBuildStep + 1} of ${BUILD_STEPS.length}`
+                    : 'Review & Generate'}
+                </span>
+              </div>
+
+              {/* Live "Your Build" Summary Strip (Always Visible) */}
+              <div className="p-3 rounded-xl bg-neutral-950/90 border border-neutral-800/90 shadow-inner">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400 flex items-center gap-1.5">
+                    <span>🛠️ Your Build Summary</span>
+                    <span className="text-amber-400 font-mono">({selectedChips.length} active)</span>
+                  </span>
+                  {selectedChips.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setBuildSelections({})}
+                      className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors"
+                    >
+                      Clear all
+                    </button>
+                  )}
+                </div>
+
+                {selectedChips.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto scrollbar-thin">
+                    {selectedChips.map((chip) => (
+                      <span
+                        key={chip.key}
+                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/15 border border-amber-500/30 text-amber-300"
+                      >
+                        <span className="text-neutral-400">{chip.stepTitle}:</span>
+                        <span>{chip.label}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveChip(chip.stepId, chip.optionId)}
+                          className="text-amber-400 hover:text-white font-bold ml-1"
+                          title="Remove"
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-neutral-500 italic">No build steps selected yet. Tap options below or add custom details.</p>
+                )}
+
+                {freeText.trim() && (
+                  <div className="mt-2 pt-1.5 border-t border-neutral-800/60 text-[11px] text-neutral-300">
+                    <span className="text-neutral-500 text-[10px] font-mono uppercase mr-1.5">Custom note:</span>
+                    <span className="italic">"{freeText.trim()}"</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Conflict Warnings Banner */}
+              {buildConflicts.length > 0 && (
+                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex flex-col gap-1.5">
+                  {buildConflicts.map((c, i) => (
+                    <div key={i} className="flex items-center gap-1.5">
+                      <span>💡</span>
+                      <span>{c.message}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Clothing Mention Warning in Build Mode */}
+              {clothingMentioned && (
+                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-2">
+                  <span className="flex items-center gap-1.5">
+                    <span>💡</span>
+                    <span>You described an outfit. Turn off Keep my outfit in Keep Locks to change it.</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setLocks((prev) => ({ ...prev, outfit: false }))}
+                    className="text-[11px] font-bold bg-amber-500 text-neutral-950 px-2 py-0.5 rounded hover:bg-amber-400 whitespace-nowrap transition-colors"
+                  >
+                    Turn Off
+                  </button>
+                </div>
+              )}
+
+              {/* ─── CASE 1: Active Step Screen (0 to 6) ─────────────────── */}
+              {currentBuildStep < BUILD_STEPS.length && (() => {
+                const step = BUILD_STEPS[currentBuildStep];
+                const isLocked = Boolean(step.requiresUnlocked && locks[step.requiresUnlocked]);
+
+                return (
+                  <div className="p-4 bg-neutral-950/70 border border-neutral-800 rounded-xl flex flex-col gap-3">
+                    {/* Big Step Title & Helper */}
                     <div>
-                      <div className={isHighlighted ? 'text-amber-400 font-bold' : 'text-neutral-200 font-medium'}>
-                        {s.title}
+                      <h3 className="text-base font-bold text-white flex items-center gap-2">
+                        <span>{step.title}</span>
+                        {step.selectMode === 'multi' && (
+                          <span className="text-[10px] font-normal px-2 py-0.5 rounded-full bg-neutral-800 text-neutral-400 border border-neutral-700">
+                            Multi-select
+                          </span>
+                        )}
+                      </h3>
+                      <p className="text-xs text-neutral-400 mt-0.5">{step.helper}</p>
+                    </div>
+
+                    {/* Collapsed view if lock is active */}
+                    {isLocked ? (
+                      <div className="p-3.5 rounded-xl bg-neutral-900/90 border border-neutral-800 text-xs text-neutral-400 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-amber-500 text-base">🔒</span>
+                          <span>
+                            Original {step.requiresUnlocked} locked. Turn off 'Keep my {step.requiresUnlocked}' in Keep Locks above to choose this.
+                          </span>
+                        </div>
                       </div>
-                      <div className="text-[11px] text-neutral-500 mt-1 line-clamp-2">
-                        {s.subtitle}
+                    ) : (
+                      /* Option Pills */
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-1">
+                        {step.options.map((opt) => {
+                          const isSelected = step.selectMode === 'multi'
+                            ? Array.isArray(buildSelections[step.id]) && buildSelections[step.id].includes(opt.id)
+                            : buildSelections[step.id] === opt.id;
+
+                          // Highlight recommended wardrobe matching selected occasion
+                          const isRecommended = step.id === 'wardrobe' && buildSelections.occasion && opt.tags?.includes(buildSelections.occasion);
+
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => handleToggleBuildOption(step, opt.id)}
+                              className={`p-2.5 rounded-xl border text-left text-xs transition-all flex flex-col justify-between ${
+                                isSelected
+                                  ? 'border-amber-500 bg-amber-500/15 text-white shadow-sm ring-1 ring-amber-500/40'
+                                  : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                              }`}
+                            >
+                              <div>
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className={isSelected ? 'text-amber-300 font-bold' : 'text-neutral-200 font-medium'}>
+                                    {opt.label}
+                                  </span>
+                                  {isRecommended && !isSelected && (
+                                    <span className="text-[9px] text-amber-400/90 font-semibold px-1 py-0.2 bg-amber-500/10 rounded">
+                                      ★ Match
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              {isSelected && (
+                                <span className="text-[10px] text-amber-400 font-bold mt-1.5">Selected ✓</span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Small Pinned Free-Text Input on Every Step */}
+                    <div className="mt-2 pt-3 border-t border-neutral-800/80">
+                      <label htmlFor="buildFreeTextInput" className="text-[11px] font-semibold text-neutral-400 flex items-center gap-1.5 mb-1.5">
+                        <span>✏️ Add your own detail (persists across steps):</span>
+                      </label>
+                      <input
+                        id="buildFreeTextInput"
+                        type="text"
+                        value={freeText}
+                        onChange={(e) => setFreeText(e.target.value)}
+                        placeholder="e.g. vintage sunglasses, warm bokeh in background..."
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-200 text-xs px-3 py-2 rounded-xl outline-none focus:border-amber-500 transition-colors"
+                      />
+                    </div>
+
+                    {/* Step Navigation Controls */}
+                    <div className="flex items-center justify-between pt-3 mt-1 border-t border-neutral-800/80">
+                      <button
+                        type="button"
+                        disabled={currentBuildStep === 0}
+                        onClick={() => setCurrentBuildStep((prev) => Math.max(0, prev - 1))}
+                        className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-neutral-800 text-neutral-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      >
+                        ← Back
+                      </button>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setCurrentBuildStep((prev) => prev + 1)}
+                          className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-neutral-800 text-neutral-400 hover:text-white transition-colors"
+                        >
+                          Skip →
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCurrentBuildStep((prev) => prev + 1)}
+                          className="text-xs font-bold px-4 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-neutral-950 transition-colors shadow"
+                        >
+                          {currentBuildStep === BUILD_STEPS.length - 1 ? 'Review Build →' : 'Next →'}
+                        </button>
                       </div>
                     </div>
-                    {isHighlighted && (
-                      <span className="text-[10px] text-amber-400 font-bold mt-2">Active Starter ✓</span>
-                    )}
-                  </button>
+                  </div>
                 );
-              })}
+              })()}
+
+              {/* ─── CASE 2: Final Review Screen ─────────────────────────── */}
+              {currentBuildStep === BUILD_STEPS.length && (
+                <div className="p-4 bg-neutral-950/70 border border-neutral-800 rounded-xl flex flex-col gap-4">
+                  <div>
+                    <h3 className="text-base font-bold text-white flex items-center gap-2">
+                      <span>Review Your Build</span>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                        Final Step
+                      </span>
+                    </h3>
+                    <p className="text-xs text-neutral-400 mt-0.5">
+                      Review all selections as removable chips, refine custom text, and shoot your photoshoot.
+                    </p>
+                  </div>
+
+                  {/* All Selected Removable Chips */}
+                  <div>
+                    <span className="text-[11px] font-bold text-neutral-300 uppercase tracking-wider block mb-2">
+                      Selected Elements ({selectedChips.length}):
+                    </span>
+                    {selectedChips.length > 0 ? (
+                      <div className="flex flex-wrap gap-2">
+                        {selectedChips.map((chip) => (
+                          <span
+                            key={chip.key}
+                            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-500/15 border border-amber-500/30 text-amber-300 shadow-sm"
+                          >
+                            <span className="text-neutral-400">{chip.stepTitle}:</span>
+                            <span className="font-semibold">{chip.label}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveChip(chip.stepId, chip.optionId)}
+                              className="text-amber-400 hover:text-white font-bold text-sm ml-1"
+                              title="Remove element"
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-neutral-500 italic p-3 bg-neutral-950 rounded-xl border border-neutral-800/80">
+                        No step options selected. You can navigate back to choose elements, or use the custom detail field below.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Free-Text Refinement Box */}
+                  <div>
+                    <label htmlFor="buildReviewFreeText" className="text-xs font-bold text-neutral-300 uppercase tracking-wider block mb-1.5">
+                      Custom Details & Notes (Appended Last):
+                    </label>
+                    <textarea
+                      id="buildReviewFreeText"
+                      rows={3}
+                      value={freeText}
+                      onChange={(e) => setFreeText(e.target.value)}
+                      placeholder="Add any specific details (e.g. holding a vintage camera, soft warm bokeh, subtle mist)..."
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 text-xs p-3 rounded-xl outline-none focus:border-amber-500 transition-colors resize-y leading-relaxed"
+                    />
+                  </div>
+
+                  {/* Review Screen Actions */}
+                  <div className="flex items-center justify-between pt-3 border-t border-neutral-800/80">
+                    <button
+                      type="button"
+                      onClick={() => setCurrentBuildStep(0)}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-neutral-800 text-neutral-400 hover:text-white transition-colors"
+                    >
+                      ← Back to Steps
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBuildSelections({})}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-neutral-800 text-neutral-500 hover:text-red-400 transition-colors"
+                    >
+                      Reset All
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Exact Final Prompt Preview for Build mode */}
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowPromptPreview(!showPromptPreview)}
+                  className="text-[11px] text-neutral-400 hover:text-amber-400 flex items-center gap-1 transition-colors"
+                >
+                  <span>{showPromptPreview ? '▾ Hide' : '▸ Preview'} exact final prompt</span>
+                </button>
+
+                {showPromptPreview && (
+                  <div className="mt-2 p-3 rounded-xl bg-black/80 border border-neutral-800 font-mono text-[11px] text-amber-200/90 leading-relaxed break-words shadow-inner">
+                    {exactFinalPrompt}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* Error Notice */}
           {error && (
@@ -1208,7 +1786,7 @@ export default function App() {
           {/* Submit Action Button */}
           <button
             type="submit"
-            disabled={loading || !file || !instruction.trim()}
+            disabled={loading || !file || !activeInstruction.trim()}
             className="w-full bg-amber-500 text-neutral-950 font-bold py-3.5 px-4 rounded-xl hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-lg shadow-amber-500/10 flex items-center justify-center gap-2"
           >
             {loading ? (
@@ -1297,7 +1875,7 @@ export default function App() {
                 <div className="text-5xl mb-3 opacity-30">✨</div>
                 <h3 className="text-sm font-semibold text-neutral-400 mb-1">Studio Viewport Empty</h3>
                 <p className="text-xs text-neutral-600 max-w-xs">
-                  Upload your photo, describe your desired photoshoot scene, and click "Shoot Photoshoot" to see your photorealistic editorial portrait here.
+                  Upload your photo, configure Quick Presets or step-by-step Build, and click "Shoot Photoshoot" to generate your high-definition editorial portrait.
                 </p>
               </div>
             )}
@@ -1369,7 +1947,6 @@ export default function App() {
                             {getLineageText(r)}
                           </div>
                           <div className="flex items-center gap-2 mt-1">
-                            {/* Result | Original Toggle */}
                             <button
                               type="button"
                               onClick={(e) => handleToggleCardView(rId, e)}
@@ -1443,7 +2020,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* REQUIREMENT 4: Batch Actions Toolbar */}
+        {/* Batch Actions Toolbar */}
         <div className="w-full bg-neutral-950/80 border border-neutral-800 rounded-xl p-3 mb-6 flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center flex-wrap gap-2">
             <button
@@ -1545,7 +2122,7 @@ export default function App() {
                     </button>
                   </div>
 
-                  {/* Thumbnail Image — Tapping opens Full-Screen Viewer (REQUIREMENT 3) */}
+                  {/* Thumbnail Image — Tapping opens Full-Screen Viewer */}
                   <div
                     className="relative cursor-pointer overflow-hidden h-44 bg-neutral-900"
                     onClick={() => {
@@ -1621,7 +2198,7 @@ export default function App() {
         )}
       </section>
 
-      {/* ─── FULL-SCREEN VIEWER MODAL (REQUIREMENT 3) ─────────────────────── */}
+      {/* ─── FULL-SCREEN VIEWER MODAL ─────────────────────────────────────── */}
       {viewerItem && (
         <div className="fixed inset-0 z-50 bg-black/95 flex flex-col backdrop-blur-md">
           {/* Header */}
@@ -1727,7 +2304,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ─── EDIT SHEET MODAL (REQUIREMENT 3) ─────────────────────────────── */}
+      {/* ─── EDIT SHEET MODAL ─────────────────────────────────────────────── */}
       {editingItem && (
         <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm">
           <div className="bg-neutral-900 border border-neutral-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
@@ -1786,7 +2363,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Requirement 3 Hint */}
               <p className="text-[11px] text-amber-300/90 mt-2 bg-amber-500/10 border border-amber-500/20 p-2 rounded-lg leading-relaxed">
                 💡 Original photo keeps your face most accurate. Edit this result is best for small changes.
               </p>
