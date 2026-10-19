@@ -76,21 +76,29 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 
 
 const router = express.Router();
 
-// Fallback pricing table per run (in USD)
+// Fallback pricing table per run (in USD) updated from user Fal billing usage
 const MODEL_PRICING = {
-  'fal-ai/flux-pro/kontext': 0.050,
-  'fal-ai/flux-pulid': 0.035,
-  'fal-ai/clarity-upscaler': 0.015,
+  'fal-ai/flux-pro/kontext': 0.040,               // Kontext: $0.04
+  'fal-ai/flux-pulid': 0.048,                     // PuLID: $0.0333/MP (~1.45MP default = ~$0.048)
+  'fal-ai/clarity-upscaler': 0.120,               // Clarity: $0.03/MP (~4MP = ~$0.12)
+  'preset_d': 0.160,                              // Preset D (Kontext $0.04 + Clarity ~$0.12): ~$0.16
   'fal-ai/nano-banana/edit': 0.039,               // Presets E & E2: $0.039
   'fal-ai/nano-banana-2/edit': 0.120,             // Preset G (2K): $0.120
   'fal-ai/gemini-3-pro-image-preview/edit': 0.150,// Preset H (2K): $0.150
-  'fal-ai/bytedance/seedream/v4.5/edit': 0.035,   // Preset F: $0.035
-  'fal-ai/bytedance/seedream/v4/edit': 0.035,
+  'fal-ai/bytedance/seedream/v4.5/edit': 0.040,   // Preset F (Seedream): $0.040
+  'fal-ai/bytedance/seedream/v4/edit': 0.040,
   'fal-ai/esrgan': 0.005,                         // ESRGAN 2x: $0.005
   'fal-ai/seedvr/upscale/image': 0.005,           // SeedVR2 2x: $0.005
-  'fal-ai/aura-sr': 0.010,                        // Aura-SR 2x: $0.010
   'realism_pass': 0.000
 };
+
+/**
+ * PuLID charges $0.0333 per megapixel of output
+ */
+function calculatePulidCost(w = 1080, h = 1350) {
+  const megapixels = (w * h) / 1000000;
+  return parseFloat(Math.max(0.033, megapixels * 0.0333).toFixed(3));
+}
 
 /**
  * Detect original photo dimensions and map closest Fal aspect ratio
@@ -179,9 +187,31 @@ async function enrichRunRecord(record, origMeta) {
     changed = true;
   }
 
-  // 4. Update Preset E/E2 cost estimate if needed
+  // 4. Update Preset pricing estimates from user Fal usage if estimated
   if ((record.preset === 'E' || record.preset === 'E2') && (record.cost === 0.015 || record.cost === 0.025)) {
     record.cost = 0.039;
+    record.costIsEstimate = true;
+    changed = true;
+  }
+  if (record.preset === 'F' && (record.cost === 0.025 || record.cost === 0.035)) {
+    record.cost = 0.040;
+    record.costIsEstimate = true;
+    changed = true;
+  }
+  if (record.preset === 'D' && (record.cost === 0.06 || record.cost === 0.065)) {
+    record.cost = 0.160;
+    record.costIsEstimate = true;
+    changed = true;
+  }
+  if (record.preset === 'A' && record.cost === 0.050) {
+    record.cost = 0.040;
+    record.costIsEstimate = true;
+    changed = true;
+  }
+  if ((record.preset === 'B' || record.preset === 'C') && (record.cost === 0.035 || !record.cost)) {
+    const pw = record.dimensions?.width || origMeta?.width || 1080;
+    const ph = record.dimensions?.height || origMeta?.height || 1350;
+    record.cost = calculatePulidCost(pw, ph);
     record.costIsEstimate = true;
     changed = true;
   }
@@ -538,7 +568,10 @@ async function processRunJob(runId, jobParams) {
         max_sequence_length: '256',
         enable_safety_checker: true
       };
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
+      estimatedCost = calculatePulidCost(
+        kontextDimensions?.width || (aspectEnum === '9:16' ? 1080 : 1080),
+        kontextDimensions?.height || (aspectEnum === '9:16' ? 1920 : 1350)
+      );
     } else if (preset === 'C') {
       presetLabel = 'Preset C (PuLID 0.8 Natural)';
       modelId = 'fal-ai/flux-pulid';
@@ -559,14 +592,17 @@ async function processRunJob(runId, jobParams) {
         max_sequence_length: '256',
         enable_safety_checker: true
       };
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pulid'];
+      estimatedCost = calculatePulidCost(
+        kontextDimensions?.width || (aspectEnum === '9:16' ? 1080 : 1080),
+        kontextDimensions?.height || (aspectEnum === '9:16' ? 1920 : 1350)
+      );
     } else if (preset === 'D') {
       presetLabel = 'Preset D (Kontext + Upscaler 0.2 + Film Grain σ=2)';
       modelId = 'fal-ai/flux-pro/kontext';
       modelInput = { prompt: editPrompt, image_url: photoUrl, seed: numSeed, aspect_ratio: aspectEnum };
       if (kontextDimensions) modelInput.image_size = kontextDimensions;
       isPipelineD = true;
-      estimatedCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
+      estimatedCost = MODEL_PRICING['preset_d'];
     } else if (preset === 'E') {
       presetLabel = 'Preset E (Nano Banana Edit)';
       modelId = 'fal-ai/nano-banana/edit';
@@ -752,7 +788,26 @@ async function processRunJob(runId, jobParams) {
 
     const runtimeMs = Date.now() - startTime;
     const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
-    const errorDetail = error?.body?.detail || error?.message || error?.toString();
+
+    let errorDetail = '';
+    if (error?.body) {
+      if (typeof error.body === 'object') {
+        errorDetail = error.body.detail
+          ? (typeof error.body.detail === 'object' ? JSON.stringify(error.body.detail, null, 2) : String(error.body.detail))
+          : JSON.stringify(error.body, null, 2);
+      } else {
+        errorDetail = String(error.body);
+      }
+    } else if (error?.message) {
+      errorDetail = error.message;
+    } else {
+      errorDetail = String(error);
+    }
+
+    if (error?.status && !errorDetail.includes(String(error.status))) {
+      errorDetail = `[HTTP ${error.status}] ${errorDetail}`;
+    }
+
     console.error(`[LAB WORKER ERROR] ${runId} after ${runtimeStr}:`, errorDetail);
 
     updateRunRecord(runId, {
@@ -1020,88 +1075,88 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       
       <div class="presets-grid">
         <!-- Preset A -->
-        <div class="preset-card selected" id="cardPresetA" onclick="toggleCardSelection('A', event)">
+        <div class="preset-card selected" id="cardPresetA" onclick="handlePresetCardClick('A', event)">
           <div class="preset-header">
             <span class="p-tag">Preset A</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.050 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetA" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <span class="p-cost">~$0.040 est.</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetA" checked onchange="togglePresetSelection('A', this.checked)">
             </div>
           </div>
           <div class="p-title">FLUX.1 Kontext [pro]</div>
           <div class="p-desc">In-context background & outfit swap. Locks exact face, hair, and pose.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">flux-pro/kontext</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyA" onclick="event.stopPropagation(); promptRunOnly('A', 'FLUX.1 Kontext', 0.050);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyA" onclick="event.stopPropagation(); promptRunOnly('A', 'FLUX.1 Kontext', 0.040);">
               ⚡ Run only this
             </button>
           </div>
         </div>
 
         <!-- Preset B -->
-        <div class="preset-card selected" id="cardPresetB" onclick="toggleCardSelection('B', event)">
+        <div class="preset-card selected" id="cardPresetB" onclick="handlePresetCardClick('B', event)">
           <div class="preset-header">
             <span class="p-tag">Preset B</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.035 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetB" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <span class="p-cost">~$0.048 est. ($0.0333/MP)</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetB" checked onchange="togglePresetSelection('B', this.checked)">
             </div>
           </div>
           <div class="p-title">PuLID Baseline 0.9</div>
           <div class="p-desc">id_weight 0.9, CFG 1.2, guidance 2.8, start_step 1, 35 steps.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">flux-pulid 0.9</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyB" onclick="event.stopPropagation(); promptRunOnly('B', 'PuLID Baseline 0.9', 0.035);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyB" onclick="event.stopPropagation(); promptRunOnly('B', 'PuLID Baseline 0.9', 0.048);">
               ⚡ Run only this
             </button>
           </div>
         </div>
 
         <!-- Preset C -->
-        <div class="preset-card selected" id="cardPresetC" onclick="toggleCardSelection('C', event)">
+        <div class="preset-card selected" id="cardPresetC" onclick="handlePresetCardClick('C', event)">
           <div class="preset-header">
             <span class="p-tag">Preset C</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.035 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetC" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <span class="p-cost">~$0.048 est. ($0.0333/MP)</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetC" checked onchange="togglePresetSelection('C', this.checked)">
             </div>
           </div>
           <div class="p-title">PuLID Natural 0.8</div>
           <div class="p-desc">id_weight 0.8, CFG 1.0 (pure flow), guidance 2.5, start_step 2, 40 steps.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">flux-pulid 0.8</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyC" onclick="event.stopPropagation(); promptRunOnly('C', 'PuLID Natural 0.8', 0.035);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyC" onclick="event.stopPropagation(); promptRunOnly('C', 'PuLID Natural 0.8', 0.048);">
               ⚡ Run only this
             </button>
           </div>
         </div>
 
         <!-- Preset D -->
-        <div class="preset-card selected" id="cardPresetD" onclick="toggleCardSelection('D', event)">
+        <div class="preset-card selected" id="cardPresetD" onclick="handlePresetCardClick('D', event)">
           <div class="preset-header">
             <span class="p-tag">Preset D</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.065 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetD" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <span class="p-cost">~$0.160 est.</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetD" checked onchange="togglePresetSelection('D', this.checked)">
             </div>
           </div>
           <div class="p-title">Kontext + Upscale + Grain</div>
-          <div class="p-desc">Preset A output &rarr; Clarity Upscaler (creativity 0.2) &rarr; Film Grain (&sigma;&approx;2).</div>
+          <div class="p-desc">Kontext ($0.04) &rarr; Clarity ($0.03/MP ~ $0.12) &rarr; Film Grain (&sigma;&approx;2).</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">Multi-Stage</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyD" onclick="event.stopPropagation(); promptRunOnly('D', 'Kontext + Upscale + Grain', 0.065);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyD" onclick="event.stopPropagation(); promptRunOnly('D', 'Kontext + Upscale + Grain', 0.160);">
               ⚡ Run only this
             </button>
           </div>
         </div>
 
         <!-- Preset E: Nano Banana Edit -->
-        <div class="preset-card selected" id="cardPresetE" onclick="toggleCardSelection('E', event)">
+        <div class="preset-card selected" id="cardPresetE" onclick="handlePresetCardClick('E', event)">
           <div class="preset-header">
             <span class="p-tag">Preset E</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.039 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetE" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetE" checked onchange="togglePresetSelection('E', this.checked)">
             </div>
           </div>
           <div class="p-title">Nano Banana Edit</div>
@@ -1115,12 +1170,12 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         </div>
 
         <!-- Preset E2: Nano Banana Desk-Preserve -->
-        <div class="preset-card selected" id="cardPresetE2" onclick="toggleCardSelection('E2', event)">
+        <div class="preset-card selected" id="cardPresetE2" onclick="handlePresetCardClick('E2', event)">
           <div class="preset-header">
             <span class="p-tag">Preset E2</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.039 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetE2" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetE2" checked onchange="togglePresetSelection('E2', this.checked)">
             </div>
           </div>
           <div class="p-title">Nano Banana Desk-Preserve</div>
@@ -1134,31 +1189,31 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         </div>
 
         <!-- Preset F: Seedream Edit -->
-        <div class="preset-card selected" id="cardPresetF" onclick="toggleCardSelection('F', event)">
+        <div class="preset-card selected" id="cardPresetF" onclick="handlePresetCardClick('F', event)">
           <div class="preset-header">
             <span class="p-tag">Preset F</span>
             <div style="display:flex;align-items:center;gap:6px;">
-              <span class="p-cost">~$0.035 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetF" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <span class="p-cost">~$0.040 est.</span>
+              <input type="checkbox" class="preset-checkbox" id="chkPresetF" checked onchange="togglePresetSelection('F', this.checked)">
             </div>
           </div>
           <div class="p-title">Seedream Edit</div>
           <div class="p-desc">ByteDance Seedream image-to-image editor with high compositional accuracy.</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:auto;">
             <span style="font-size:0.7rem;color:var(--amber);">seedream edit</span>
-            <button type="button" class="run-only-btn" id="btnRunOnlyF" onclick="event.stopPropagation(); promptRunOnly('F', 'Seedream Edit', 0.035);">
+            <button type="button" class="run-only-btn" id="btnRunOnlyF" onclick="event.stopPropagation(); promptRunOnly('F', 'Seedream Edit', 0.040);">
               ⚡ Run only this
             </button>
           </div>
         </div>
 
         <!-- Preset G: Nano Banana 2 Edit (2K) -->
-        <div class="preset-card selected" id="cardPresetG" onclick="toggleCardSelection('G', event)">
+        <div class="preset-card selected" id="cardPresetG" onclick="handlePresetCardClick('G', event)">
           <div class="preset-header">
             <span class="p-tag">Preset G</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.120 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetG" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetG" checked onchange="togglePresetSelection('G', this.checked)">
             </div>
           </div>
           <div class="p-title">Nano Banana 2 Edit (2K)</div>
@@ -1172,12 +1227,12 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         </div>
 
         <!-- Preset H: Nano Banana Pro Edit (2K) -->
-        <div class="preset-card selected" id="cardPresetH" onclick="toggleCardSelection('H', event)">
+        <div class="preset-card selected" id="cardPresetH" onclick="handlePresetCardClick('H', event)">
           <div class="preset-header">
             <span class="p-tag">Preset H</span>
             <div style="display:flex;align-items:center;gap:6px;">
               <span class="p-cost">~$0.150 est.</span>
-              <input type="checkbox" class="preset-checkbox" id="chkPresetH" checked onclick="event.stopPropagation(); updateSelectedCount();">
+              <input type="checkbox" class="preset-checkbox" id="chkPresetH" checked onchange="togglePresetSelection('H', this.checked)">
             </div>
           </div>
           <div class="p-title">Nano Banana Pro Edit (2K)</div>
@@ -1346,43 +1401,71 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       saveCurrentState();
     }
 
-    // REQUIREMENT 2: Tapping card toggles checkbox, NEVER runs a model
-    function toggleCardSelection(presetId, event) {
-      const chk = document.getElementById('chkPreset' + presetId);
-      if (chk) {
-        chk.checked = !chk.checked;
-        updateSelectedCount();
+    function escapeHtml(str) {
+      if (str == null) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // REQUIREMENT 1: SINGLE SOURCE OF TRUTH FOR PRESET SELECTION
+    const PRESET_DEFINITIONS = [
+      { id: 'A', name: 'Preset A (Flux-Pro Kontext)', cost: 0.040 },
+      { id: 'B', name: 'Preset B (PuLID 0.9)', cost: 0.048 },
+      { id: 'C', name: 'Preset C (PuLID 0.8 Natural)', cost: 0.048 },
+      { id: 'D', name: 'Preset D (Kontext + Upscale + Grain)', cost: 0.160 },
+      { id: 'E', name: 'Preset E (Nano Banana Edit)', cost: 0.039 },
+      { id: 'E2', name: 'Preset E2 (Nano Banana Desk-Preserve)', cost: 0.039 },
+      { id: 'F', name: 'Preset F (Seedream Edit)', cost: 0.040 },
+      { id: 'G', name: 'Preset G (Nano Banana 2 Edit, 2K)', cost: 0.120 },
+      { id: 'H', name: 'Preset H (Nano Banana Pro Edit, 2K)', cost: 0.150 }
+    ];
+
+    // The single source of truth state array: all presets selected by default
+    let selectedPresetIds = PRESET_DEFINITIONS.map(p => p.id);
+
+    function syncPresetSelectionUI() {
+      PRESET_DEFINITIONS.forEach(p => {
+        const isSelected = selectedPresetIds.includes(p.id);
+        const chk = document.getElementById('chkPreset' + p.id);
+        const card = document.getElementById('cardPreset' + p.id);
+        if (chk) chk.checked = isSelected;
+        if (card) card.classList.toggle('selected', isSelected);
+      });
+      const lbl = document.getElementById('runSelectedLabel');
+      if (lbl) {
+        lbl.textContent = '⚡ Run Selected Presets (' + selectedPresetIds.length + ' of ' + PRESET_DEFINITIONS.length + ' Selected)';
       }
     }
 
-    function updateSelectedCount() {
-      const all = ['A', 'B', 'C', 'D', 'E', 'E2', 'F', 'G', 'H'];
-      let count = 0;
-      all.forEach(p => {
-        const chk = document.getElementById('chkPreset' + p);
-        const card = document.getElementById('cardPreset' + p);
-        if (chk && card) {
-          card.classList.toggle('selected', chk.checked);
-          if (chk.checked) count++;
-        }
-      });
-      document.getElementById('runSelectedLabel').textContent = \`⚡ Run Selected Presets (\${count} of \${all.length} Selected)\`;
+    function togglePresetSelection(presetId, forceState = null) {
+      const idx = selectedPresetIds.indexOf(presetId);
+      const shouldSelect = forceState !== null ? Boolean(forceState) : (idx === -1);
+      if (shouldSelect && idx === -1) {
+        selectedPresetIds.push(presetId);
+      } else if (!shouldSelect && idx !== -1) {
+        selectedPresetIds.splice(idx, 1);
+      }
+      syncPresetSelectionUI();
+    }
+
+    function handlePresetCardClick(presetId, event) {
+      if (event.target.closest('.run-only-btn') || event.target.tagName === 'INPUT') return;
+      togglePresetSelection(presetId);
     }
 
     function toggleAllPresets(checked) {
-      ['A', 'B', 'C', 'D', 'E', 'E2', 'F', 'G', 'H'].forEach(p => {
-        const chk = document.getElementById('chkPreset' + p);
-        const card = document.getElementById('cardPreset' + p);
-        if (chk) chk.checked = checked;
-        if (card) card.classList.toggle('selected', checked);
-      });
-      updateSelectedCount();
+      selectedPresetIds = checked ? PRESET_DEFINITIONS.map(p => p.id) : [];
+      syncPresetSelectionUI();
     }
 
     // REQUIREMENT 3: Explicit "Run only this" with cost confirmation
     function promptRunOnly(preset, name, cost) {
       const formattedCost = '~\$' + cost.toFixed(3) + ' est.';
-      if (confirm(\`Run \${name} now? (\${formattedCost})\`)) {
+      if (confirm('Run ' + name + ' now? (' + formattedCost + ')')) {
         runPreset(preset);
       }
     }
@@ -1596,6 +1679,14 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         if (r.status === 'error' || r.status === 'interrupted' || r.status === 'canceled') {
           const badgeClass = r.status === 'error' ? 'background:#ef4444;color:#fff;' : 'background:#f59e0b;color:#000;';
           const label = r.status === 'error' ? '❌ Failed' : (r.status === 'interrupted' ? '⚠️ Interrupted' : '🚫 Canceled');
+          let errFormatted = 'Unknown error occurred';
+          if (r.error) {
+            if (typeof r.error === 'object') {
+              try { errFormatted = JSON.stringify(r.error, null, 2); } catch (e) { errFormatted = String(r.error); }
+            } else {
+              errFormatted = String(r.error);
+            }
+          }
           return \`
             <div class="result-card failed" id="card-\${r.id}">
               <div class="res-header">
@@ -1617,11 +1708,9 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
                 </div>
                 <div class="comp-col">
                   <span class="comp-label">Failure Diagnostic</span>
-                  <div class="error-box">
-                    <div style="font-weight:700;color:#fca5a5;font-size:0.85rem;">Run Terminated:</div>
-                    <div style="font-family:monospace;font-size:0.75rem;color:#fecaca;max-height:160px;overflow-y:auto;text-align:left;background:#180606;padding:8px;border-radius:6px;width:100%;box-sizing:border-box;">
-                      \${r.error || 'Unknown error occurred'}
-                    </div>
+                  <div class="error-box" style="width:100%;box-sizing:border-box;">
+                    <div style="font-weight:700;color:#fca5a5;font-size:0.85rem;margin-bottom:6px;">Fal Error Diagnostic:</div>
+                    <pre style="white-space:pre-wrap;word-break:break-word;font-family:monospace;font-size:0.75rem;color:#fecaca;max-height:220px;overflow-y:auto;text-align:left;background:#180606;padding:10px;border-radius:6px;width:100%;box-sizing:border-box;margin:0;border:1px solid rgba(239,68,68,0.3);user-select:all;">\${escapeHtml(errFormatted)}</pre>
                   </div>
                 </div>
               </div>
@@ -1662,7 +1751,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
               </div>
             </div>
 
-            <!-- REQUIREMENT 5: Upscale Pass Panel (ESRGAN, SeedVR, Aura-SR at 2x) -->
+            <!-- REQUIREMENT 5: Upscale Pass Panel (ESRGAN, SeedVR at 2x) -->
             <div id="upscalePanel-\${r.id}" class="upscale-panel" style="display:none;background:#18181b;padding:12px;border-radius:8px;margin-bottom:12px;border:1px solid #38bdf8;flex-direction:column;gap:8px;">
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;">
                 <span style="font-size:0.75rem;font-weight:700;color:#38bdf8;">Non-Generative 2x Super-Resolution (Zero Sharpening • Zero Grain)</span>
@@ -1672,7 +1761,6 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
                 <select id="upscaleModel-\${r.id}" style="background:#09090b;color:#fff;border:1px solid #3f3f46;border-radius:6px;padding:6px 10px;font-size:0.78rem;">
                   <option value="fal-ai/esrgan">ESRGAN 2x (Classic crisp edge super-res) — ~$0.005 est.</option>
                   <option value="fal-ai/seedvr/upscale/image">SeedVR2 2x (Clean artifact removal) — ~$0.005 est.</option>
-                  <option value="fal-ai/aura-sr">Aura-SR 2x (GigaGAN photorealistic super-res) — ~$0.010 est.</option>
                 </select>
                 <button type="button" class="res-btn" id="btnRunUpscale-\${r.id}" style="background:#38bdf8;color:#000;font-weight:700;border:none;" onclick="applyUpscalePass('\${r.id}')">▶ Run 2x Upscale</button>
               </div>
@@ -2061,16 +2149,8 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
 
     async function runSelectedSequential() {
-      const allPresets = [
-        { id: 'A', name: 'Preset A (Flux-Pro Kontext)' },
-        { id: 'B', name: 'Preset B (PuLID 0.9)' },
-        { id: 'C', name: 'Preset C (PuLID 0.8)' },
-        { id: 'D', name: 'Preset D (Kontext + Upscale + Grain)' },
-        { id: 'E', name: 'Preset E (Nano Banana Edit)' },
-        { id: 'F', name: 'Preset F (Seedream Edit)' }
-      ];
-
-      const queue = allPresets.filter(p => document.getElementById('chkPreset' + p.id)?.checked);
+      // REQUIREMENT 1: Read single source of truth array
+      const queue = PRESET_DEFINITIONS.filter(p => selectedPresetIds.includes(p.id));
       if (!queue.length) {
         alert('Please select at least one preset to run.');
         return;
@@ -2092,17 +2172,25 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
         const item = queue[i];
         const pct = Math.round((i / queue.length) * 100);
         progressFill.style.width = pct + '%';
-        progressText.textContent = \`Running [\${i + 1}/\${queue.length}]: \${item.name}...\`;
+        progressText.textContent = 'Running [' + (i + 1) + '/' + queue.length + ']: ' + item.name + '...';
 
         try {
           const runData = await submitRun(item.id);
           const runId = runData.runId;
           await loadResults();
-          await pollRunUntilDone(runId, 185000);
+          const pollRes = await pollRunUntilDone(runId, 185000);
           await loadResults();
+          if (pollRes && pollRes.status === 'error') {
+            console.warn('[LAB BATCH] Preset ' + item.name + ' completed with error: ' + (pollRes.error || 'Failed'));
+            progressText.textContent = '⚠️ [' + (i + 1) + '/' + queue.length + '] ' + item.name + ' failed. Continuing next preset...';
+            await new Promise(r => setTimeout(r, 1200));
+          }
         } catch (err) {
-          console.warn(\`Preset \${item.name} failed:\`, err.message);
+          // REQUIREMENT 2: Show error and NEVER abort batch
+          console.warn('Preset ' + item.name + ' failed:', err.message);
+          progressText.textContent = '⚠️ [' + (i + 1) + '/' + queue.length + '] ' + item.name + ' error. Continuing next preset...';
           await loadResults();
+          await new Promise(r => setTimeout(r, 1200));
         }
       }
 
@@ -2161,6 +2249,11 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
             max_sequence_length: '256'
           }
         };
+      } else if (preset === 'D') {
+        cfg = {
+          model: 'fal-ai/flux-pro/kontext',
+          input: { prompt: editPrompt, seed: seed }
+        };
       } else if (preset === 'E') {
         cfg = {
           model: 'fal-ai/nano-banana/edit',
@@ -2195,6 +2288,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       document.getElementById('customJsonInput').value = JSON.stringify(cfg, null, 2);
     }
 
+    syncPresetSelectionUI();
     loadLabState();
     loadResults();
   </script>
@@ -2494,11 +2588,7 @@ router.post('/api/lab/results/:id/upscale', labAuthMiddleware, async (req, res) 
     let modelLabel = '';
     let estimatedCost = 0.005;
 
-    if (modelId === 'fal-ai/aura-sr') {
-      modelLabel = 'Aura-SR 2x';
-      modelInput = { image_url: parentFalUrl, checkpoint: 'v2', overlapping_tiles: false };
-      estimatedCost = MODEL_PRICING['fal-ai/aura-sr'] || 0.010;
-    } else if (modelId === 'fal-ai/seedvr/upscale/image') {
+    if (modelId === 'fal-ai/seedvr/upscale/image') {
       modelLabel = 'SeedVR2 2x';
       modelInput = { image_url: parentFalUrl, upscale_mode: 'factor', factor: 2 };
       estimatedCost = MODEL_PRICING['fal-ai/seedvr/upscale/image'] || 0.005;
@@ -2520,16 +2610,6 @@ router.post('/api/lab/results/:id/upscale', labAuthMiddleware, async (req, res) 
     const upRes = await fetch(upscaledUrl);
     if (!upRes.ok) throw new Error(`Failed to download upscaled image: ${upRes.statusText}`);
     let upscaledBuffer = Buffer.from(await upRes.arrayBuffer());
-
-    // Aura-SR natively scales 4x; resize to exact 2x of parent without sharpening or grain
-    if (modelId === 'fal-ai/aura-sr') {
-      const targetW = Math.round(parentW * 2);
-      const targetH = Math.round(parentH * 2);
-      upscaledBuffer = await sharp(upscaledBuffer)
-        .resize(targetW, targetH, { fit: 'fill' })
-        .jpeg({ quality: 96 })
-        .toBuffer();
-    }
 
     const genMeta = await sharp(upscaledBuffer).metadata();
     const origMeta = await getOriginalPhotoMetadata();
@@ -2802,7 +2882,7 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
 
   let presetLabel = `Preset ${preset}`;
   let initialModel = 'fal-ai/flux-pulid';
-  let initialCost = 0.035;
+  let initialCost = 0.040;
 
   if (preset === 'A') {
     presetLabel = 'Preset A (Flux-Pro Kontext)';
@@ -2811,15 +2891,15 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
   } else if (preset === 'B') {
     presetLabel = 'Preset B (PuLID 0.9)';
     initialModel = 'fal-ai/flux-pulid';
-    initialCost = MODEL_PRICING['fal-ai/flux-pulid'];
+    initialCost = calculatePulidCost(origMeta.width, origMeta.height);
   } else if (preset === 'C') {
     presetLabel = 'Preset C (PuLID 0.8 Natural)';
     initialModel = 'fal-ai/flux-pulid';
-    initialCost = MODEL_PRICING['fal-ai/flux-pulid'];
+    initialCost = calculatePulidCost(origMeta.width, origMeta.height);
   } else if (preset === 'D') {
     presetLabel = 'Preset D (Kontext + Upscale + Grain)';
     initialModel = 'fal-ai/flux-pro/kontext';
-    initialCost = MODEL_PRICING['fal-ai/flux-pro/kontext'] + MODEL_PRICING['fal-ai/clarity-upscaler'];
+    initialCost = MODEL_PRICING['preset_d'];
   } else if (preset === 'E') {
     presetLabel = 'Preset E (Nano Banana Edit)';
     initialModel = 'fal-ai/nano-banana/edit';
