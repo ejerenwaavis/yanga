@@ -89,8 +89,26 @@ const MODEL_PRICING = {
   'fal-ai/bytedance/seedream/v4/edit': 0.040,
   'fal-ai/esrgan': 0.005,                         // ESRGAN 2x: $0.005
   'fal-ai/seedvr/upscale/image': 0.005,           // SeedVR2 2x: $0.005
+  'pipeline_v2': 0.044,                           // Nano Banana $0.039 + SeedVR2 $0.005
+  'V2': 0.044,
   'realism_pass': 0.000
 };
+
+/**
+ * Canonical Prompt Builder for Pipeline v2 (Instruction + Locks)
+ */
+function buildV2Prompt(instruction, locks = {}) {
+  const cleanInstruction = (instruction || '').trim();
+  const lockPhrases = [];
+  if (locks.outfit) lockPhrases.push('same outfit');
+  if (locks.pose) lockPhrases.push('same pose');
+  if (locks.hair) lockPhrases.push('same hair');
+  if (locks.props) lockPhrases.push('same props and objects');
+  if (locks.background) lockPhrases.push('same background');
+
+  const locksPart = lockPhrases.length > 0 ? `, ${lockPhrases.join(', ')}` : '';
+  return `Edit this photo: ${cleanInstruction}. Keep the person's face, skin tone, facial features, expression and body proportions exactly identical to the photo${locksPart}. If my request conflicts with a keep rule, follow my request. No readable text, signs or logos in the background. Clean sky with no stray shapes. Natural unretouched photo.`;
+}
 
 /**
  * PuLID charges $0.0333 per megapixel of output
@@ -240,6 +258,14 @@ function readLabState() {
     mode: 'scene_only',
     scene: 'in a sleek modern high-rise executive corner office, sitting by floor-to-ceiling panoramic glass windows overlooking city skyline, clean modern architectural interior, crisp natural window light, commanding executive confidence',
     outfit: 'wearing an impeccably tailored bespoke Italian business suit with silk pocket square',
+    instruction: 'Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows.',
+    locks: {
+      outfit: true,
+      pose: true,
+      hair: true,
+      props: true,
+      background: false
+    },
     outputSize: 'match_original',
     seed: 42,
     lastConfig: {
@@ -476,7 +502,7 @@ export function labAuthMiddleware(req, res, next) {
 async function processRunJob(runId, jobParams) {
   if (deletedRunIds.has(runId)) return;
 
-  const { preset, mode, scene, outfit, outputSize, seed, customConfig, falKey } = jobParams;
+  const { preset, mode, scene, outfit, instruction, locks, outputSize, seed, customConfig, falKey } = jobParams;
   const numSeed = parseInt(seed, 10) || 42;
   const startTime = Date.now();
 
@@ -511,8 +537,11 @@ async function processRunJob(runId, jobParams) {
     // Detect original aspect ratio for matching
     const origMeta = await getOriginalPhotoMetadata();
 
+    const effectiveLocks = locks || { outfit: true, pose: true, hair: true, props: true, background: false };
     let editPrompt = '';
-    if (mode === 'scene_outfit' && outfit && outfit.trim()) {
+    if (mode === 'custom_instruction' || instruction) {
+      editPrompt = buildV2Prompt(instruction || scene, effectiveLocks);
+    } else if (mode === 'scene_outfit' && outfit && outfit.trim()) {
       editPrompt = `Change the background to ${scene.trim()} and change the outfit to ${outfit.trim()}. Keep the person's face, hair, pose and expression exactly identical. Natural unretouched photo.`;
     } else {
       editPrompt = `Change only the background to ${scene.trim()}. Keep the person's face, hair, outfit, pose and expression exactly identical. Natural unretouched photo.`;
@@ -522,6 +551,7 @@ async function processRunJob(runId, jobParams) {
     let modelInput = {};
     let presetLabel = '';
     let isPipelineD = false;
+    let isPipelineV2 = false;
     let estimatedCost = 0.040;
 
     // Map output size explicitly
@@ -649,6 +679,19 @@ async function processRunJob(runId, jobParams) {
         aspect_ratio: aspectEnum
       };
       estimatedCost = MODEL_PRICING['fal-ai/gemini-3-pro-image-preview/edit'];
+    } else if (preset === 'V2' || preset === 'v2') {
+      presetLabel = 'Production Pipeline v2 (Nano Banana + SeedVR2 2x)';
+      modelId = 'fal-ai/nano-banana/edit';
+      modelInput = {
+        prompt: editPrompt,
+        image_urls: [photoUrl],
+        image_url: photoUrl,
+        num_images: 1,
+        seed: numSeed,
+        aspect_ratio: aspectEnum
+      };
+      isPipelineV2 = true;
+      estimatedCost = 0.044; // Nano Banana $0.039 + SeedVR2 $0.005
     } else if (preset === 'custom' && customConfig) {
       presetLabel = 'Custom Run';
       modelId = customConfig.model || 'fal-ai/flux-pulid';
@@ -729,6 +772,27 @@ async function processRunJob(runId, jobParams) {
       if (upscaledUrl) finalImageUrl = upscaledUrl;
     }
 
+    // Pipeline V2 multi-stage: SeedVR2 2x super-resolution upscale
+    if (isPipelineV2) {
+      console.log(`[LAB WORKER V2] Stage 2: Passing to fal-ai/seedvr/upscale/image at 2x...`);
+      try {
+        const upscaleResult = await fal.subscribe('fal-ai/seedvr/upscale/image', {
+          input: {
+            image_url: finalImageUrl,
+            upscale_mode: 'factor',
+            factor: 2
+          }
+        });
+        const upscaledUrl = upscaleResult.data?.image?.url || upscaleResult.data?.images?.[0]?.url || upscaleResult.image?.url || upscaleResult.images?.[0]?.url;
+        if (upscaledUrl) {
+          finalImageUrl = upscaledUrl;
+          console.log(`[LAB WORKER V2] SeedVR2 2x upscale succeeded.`);
+        }
+      } catch (v2UpErr) {
+        console.warn(`[LAB WORKER V2] SeedVR2 upscale failed, keeping step 1:`, v2UpErr.message);
+      }
+    }
+
     if (deletedRunIds.has(runId) || activeJobs.get(runId)?.isCanceled) return;
 
     const imgResponse = await fetch(finalImageUrl);
@@ -756,11 +820,14 @@ async function processRunJob(runId, jobParams) {
     const runtimeMs = Date.now() - startTime;
     const runtimeStr = (runtimeMs / 1000).toFixed(1) + 's';
 
-    // REQUIREMENT 6: Save model's original response URL (modelResponseUrl & remoteUrl) in run JSON
+    // Save model's original response URL, prompt, instruction, and locks in run JSON
     updateRunRecord(runId, {
       status: 'done',
-      model: isPipelineD ? 'flux-pro/kontext + clarity-upscaler + film grain' : modelId,
+      model: isPipelineV2 ? 'nano-banana/edit + seedvr/upscale/image 2x' : (isPipelineD ? 'flux-pro/kontext + clarity-upscaler + film grain' : modelId),
       params: modelInput,
+      prompt: editPrompt,
+      instruction: instruction || (mode === 'custom_instruction' ? scene : null),
+      locks: effectiveLocks,
       seed: modelInput.seed ?? numSeed,
       runtime: runtimeStr,
       cost: finalCost,
@@ -1017,23 +1084,101 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
           <span>Prompt & Framing Calibration</span>
         </div>
         
-        <!-- Scene Only vs Scene + Outfit Change Toggle -->
+        <!-- Scene Only vs Scene + Outfit Change vs Custom Instruction Toggle -->
         <div class="toggle-group">
           <button type="button" class="toggle-btn active" id="btnModeSceneOnly" onclick="setMode('scene_only')">Scene Only</button>
-          <button type="button" class="toggle-btn" id="btnModeSceneOutfit" onclick="setMode('scene_outfit')">Scene + Outfit Change</button>
+          <button type="button" class="toggle-btn" id="btnModeSceneOutfit" onclick="setMode('scene_outfit')">Scene + Outfit</button>
+          <button type="button" class="toggle-btn" id="btnModeCustomInstruction" onclick="setMode('custom_instruction')">✍️ Custom Instruction</button>
         </div>
       </div>
 
-      <!-- Scene Description -->
-      <div>
-        <label>Scene Description (Destination environment, lighting & interior)</label>
-        <textarea id="sceneInput" placeholder="Describe the scene environment, lighting, and interior..."></textarea>
+      <!-- Standard Scene Description Container -->
+      <div id="standardSceneContainer">
+        <div>
+          <label>Scene Description (Destination environment, lighting & interior)</label>
+          <textarea id="sceneInput" placeholder="Describe the scene environment, lighting, and interior..."></textarea>
+        </div>
+
+        <!-- Outfit Description (Conditional) -->
+        <div id="outfitContainer" style="display:none;margin-top:10px;">
+          <label>Outfit Instruction (Replaces original clothes while keeping face & pose identical)</label>
+          <input type="text" id="outfitInput" placeholder="e.g. wearing an impeccably tailored navy bespoke Italian suit with silk pocket square">
+        </div>
       </div>
 
-      <!-- Outfit Description (Conditional) -->
-      <div id="outfitContainer" style="display:none;">
-        <label>Outfit Instruction (Replaces original clothes while keeping face & pose identical)</label>
-        <input type="text" id="outfitInput" placeholder="e.g. wearing an impeccably tailored navy bespoke Italian suit with silk pocket square">
+      <!-- Custom Instruction Composer Container (Requirement 12) -->
+      <div id="customInstructionContainer" style="display:none;">
+        <div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <label style="margin:0;font-weight:700;color:#fff;">Describe your photo (Single Source of Truth)</label>
+            <span style="font-size:0.7rem;color:var(--text-muted);">Pipeline v2 Canonical Composer</span>
+          </div>
+          <textarea id="instructionInput" oninput="handleLabInstructionInput()" placeholder="e.g. Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows." style="min-height:90px;"></textarea>
+        </div>
+
+        <!-- Clothing Mention Warning Hint -->
+        <div id="labClothingHint" style="display:none;background:rgba(245,158,11,0.15);border:1px solid rgba(245,158,11,0.3);color:#fef08a;padding:8px 12px;border-radius:8px;font-size:0.75rem;margin-top:8px;display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <span>💡 You described an outfit. Turn off Keep my outfit to change it.</span>
+          <button type="button" class="res-btn" onclick="toggleLabLock('outfit', false)">Turn Off</button>
+        </div>
+
+        <!-- Lock Toggles -->
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid #27272a;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <span style="font-size:0.75rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;">Keep Rules & Locks</span>
+            <span style="font-size:0.7rem;color:#34d399;background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.3);padding:2px 8px;border-radius:6px;font-weight:600;">🔒 Face is always locked</span>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));gap:8px;">
+            <label style="display:flex;align-items:center;gap:8px;background:#18181b;border:1px solid #27272a;padding:8px 10px;border-radius:8px;cursor:pointer;margin:0;font-size:0.75rem;color:#fff;">
+              <input type="checkbox" id="chkLockOutfit" checked onchange="handleLabInstructionInput()" style="accent-color:var(--amber);width:16px;height:16px;">
+              <span>Keep my outfit</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;background:#18181b;border:1px solid #27272a;padding:8px 10px;border-radius:8px;cursor:pointer;margin:0;font-size:0.75rem;color:#fff;">
+              <input type="checkbox" id="chkLockPose" checked onchange="handleLabInstructionInput()" style="accent-color:var(--amber);width:16px;height:16px;">
+              <span>Keep my pose</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;background:#18181b;border:1px solid #27272a;padding:8px 10px;border-radius:8px;cursor:pointer;margin:0;font-size:0.75rem;color:#fff;">
+              <input type="checkbox" id="chkLockHair" checked onchange="handleLabInstructionInput()" style="accent-color:var(--amber);width:16px;height:16px;">
+              <span>Keep my hair</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;background:#18181b;border:1px solid #27272a;padding:8px 10px;border-radius:8px;cursor:pointer;margin:0;font-size:0.75rem;color:#fff;">
+              <input type="checkbox" id="chkLockProps" checked onchange="handleLabInstructionInput()" style="accent-color:var(--amber);width:16px;height:16px;">
+              <span>Keep props/objects</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;background:#18181b;border:1px solid #27272a;padding:8px 10px;border-radius:8px;cursor:pointer;margin:0;font-size:0.75rem;color:#fff;">
+              <input type="checkbox" id="chkLockBackground" onchange="handleLabInstructionInput()" style="accent-color:var(--amber);width:16px;height:16px;">
+              <span>Keep background</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Quick Scene Starters -->
+        <div style="margin-top:12px;">
+          <span style="font-size:0.72rem;color:var(--text-muted);display:block;margin-bottom:6px;font-weight:600;">Quick Starters (Tap to fill instruction & turn off Keep Background):</span>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;">
+            <button type="button" class="res-btn" onclick="setLabStarter('Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows.')">London Mayfair</button>
+            <button type="button" class="res-btn" onclick="setLabStarter('Place me in a luxury glass penthouse suite overlooking a glittering city night skyline with ambient chandelier lighting and celebratory golden atmosphere.')">Penthouse Luxe</button>
+            <button type="button" class="res-btn" onclick="setLabStarter('Place me along a private tropical coastline at sunset with gentle ocean breeze, pastel skies, and soft turquoise water reflections.')">Coastline Sunset</button>
+            <button type="button" class="res-btn" onclick="setLabStarter('Place me at an opulent Lagos wedding reception ballroom with dazzling crystal chandelier bokeh and warm festive banquet ambient lighting.')">Royal Owambe</button>
+            <button type="button" class="res-btn" onclick="setLabStarter('Place me in a sleek modern high-rise executive corner office with floor-to-ceiling panoramic glass windows overlooking a city skyline.')">Corner Office</button>
+            <button type="button" class="res-btn" onclick="setLabStarter('Place me in an elite portrait studio against a hand-painted textured charcoal canvas backdrop with soft dramatic studio key lighting.')">Charcoal Studio</button>
+          </div>
+        </div>
+
+        <!-- Collapsed Prompt Preview -->
+        <details style="margin-top:12px;">
+          <summary style="cursor:pointer;font-size:0.75rem;color:var(--amber);font-weight:700;">▸ Preview exact final prompt</summary>
+          <div id="labPromptPreview" class="code-box" style="margin-top:6px;padding:8px 12px;border-radius:8px;line-height:1.4;white-space:pre-wrap;word-break:break-word;"></div>
+        </details>
+
+        <!-- Direct Pipeline v2 Runner -->
+        <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button type="button" class="upload-btn-label" style="background:linear-gradient(135deg, #f59e0b, #d97706);color:#000;border:none;font-weight:800;padding:10px 16px;" onclick="runPreset('V2')">
+            ⚡ Run Winning Pipeline (Nano Banana + SeedVR2 2x)
+          </button>
+          <span style="font-size:0.72rem;color:var(--text-muted);">$0.044 est. • Production Pipeline</span>
+        </div>
       </div>
 
       <div style="display:grid;grid-template-columns:1fr 1fr 120px;gap:12px;align-items:end;">
@@ -1395,9 +1540,87 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
 
     function setMode(mode) {
       currentMode = mode;
-      document.getElementById('btnModeSceneOnly').classList.toggle('active', mode === 'scene_only');
-      document.getElementById('btnModeSceneOutfit').classList.toggle('active', mode === 'scene_outfit');
-      document.getElementById('outfitContainer').style.display = mode === 'scene_outfit' ? 'block' : 'none';
+      document.getElementById('btnModeSceneOnly')?.classList.toggle('active', mode === 'scene_only');
+      document.getElementById('btnModeSceneOutfit')?.classList.toggle('active', mode === 'scene_outfit');
+      document.getElementById('btnModeCustomInstruction')?.classList.toggle('active', mode === 'custom_instruction');
+
+      const stdContainer = document.getElementById('standardSceneContainer');
+      const customContainer = document.getElementById('customInstructionContainer');
+      if (mode === 'custom_instruction') {
+        if (stdContainer) stdContainer.style.display = 'none';
+        if (customContainer) customContainer.style.display = 'block';
+        updateLabPromptPreview();
+      } else {
+        if (stdContainer) stdContainer.style.display = 'block';
+        if (customContainer) customContainer.style.display = 'none';
+        const outfitEl = document.getElementById('outfitContainer');
+        if (outfitEl) outfitEl.style.display = mode === 'scene_outfit' ? 'block' : 'none';
+      }
+      saveCurrentState();
+    }
+
+    const CLOTHING_REGEX = /\b(suit|tuxedo|dress|shirt|jacket|blazer|hoodie|coat|pants|trousers|skirt|jeans|tie|sweater|outfit|vest|blouse|gown|hat|shoes|boots|sneakers|wearing|dressed in)\b/i;
+
+    function getEffectiveLocks() {
+      return {
+        outfit: document.getElementById('chkLockOutfit') ? document.getElementById('chkLockOutfit').checked : true,
+        pose: document.getElementById('chkLockPose') ? document.getElementById('chkLockPose').checked : true,
+        hair: document.getElementById('chkLockHair') ? document.getElementById('chkLockHair').checked : true,
+        props: document.getElementById('chkLockProps') ? document.getElementById('chkLockProps').checked : true,
+        background: document.getElementById('chkLockBackground') ? document.getElementById('chkLockBackground').checked : false
+      };
+    }
+
+    function buildV2PromptClient(instruction, locks) {
+      const cleanInstruction = (instruction || '').trim();
+      const lockPhrases = [];
+      if (locks.outfit) lockPhrases.push('same outfit');
+      if (locks.pose) lockPhrases.push('same pose');
+      if (locks.hair) lockPhrases.push('same hair');
+      if (locks.props) lockPhrases.push('same props and objects');
+      if (locks.background) lockPhrases.push('same background');
+
+      const locksPart = lockPhrases.length > 0 ? (', ' + lockPhrases.join(', ')) : '';
+
+      return 'Edit this photo: ' + cleanInstruction + '. Keep the person\\\'s face, skin tone, facial features, expression and body proportions exactly identical to the photo' + locksPart + '. If my request conflicts with a keep rule, follow my request. No readable text, signs or logos in the background. Clean sky with no stray shapes. Natural unretouched photo.';
+    }
+
+    function updateLabPromptPreview() {
+      const instruction = document.getElementById('instructionInput')?.value || '';
+      const locks = getEffectiveLocks();
+      const previewEl = document.getElementById('labPromptPreview');
+      if (previewEl) {
+        previewEl.textContent = buildV2PromptClient(instruction, locks);
+      }
+      
+      const hintEl = document.getElementById('labClothingHint');
+      if (hintEl) {
+        const mentionsClothing = CLOTHING_REGEX.test(instruction);
+        hintEl.style.display = (mentionsClothing && locks.outfit) ? 'flex' : 'none';
+      }
+    }
+
+    function handleLabInstructionInput() {
+      updateLabPromptPreview();
+    }
+
+    function toggleLabLock(key, val) {
+      if (key === 'outfit' && document.getElementById('chkLockOutfit')) {
+        document.getElementById('chkLockOutfit').checked = val;
+      }
+      updateLabPromptPreview();
+      saveCurrentState();
+    }
+
+    function setLabStarter(text) {
+      const input = document.getElementById('instructionInput');
+      if (input) {
+        input.value = text;
+      }
+      if (document.getElementById('chkLockBackground')) {
+        document.getElementById('chkLockBackground').checked = false;
+      }
+      updateLabPromptPreview();
       saveCurrentState();
     }
 
@@ -1490,6 +1713,16 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
             setMode(data.state.mode || 'scene_only');
             document.getElementById('sceneInput').value = data.state.scene || '';
             document.getElementById('outfitInput').value = data.state.outfit || '';
+            if (document.getElementById('instructionInput')) {
+              document.getElementById('instructionInput').value = data.state.instruction || 'Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows.';
+            }
+            if (data.state.locks) {
+              if (document.getElementById('chkLockOutfit')) document.getElementById('chkLockOutfit').checked = data.state.locks.outfit !== false;
+              if (document.getElementById('chkLockPose')) document.getElementById('chkLockPose').checked = data.state.locks.pose !== false;
+              if (document.getElementById('chkLockHair')) document.getElementById('chkLockHair').checked = data.state.locks.hair !== false;
+              if (document.getElementById('chkLockProps')) document.getElementById('chkLockProps').checked = data.state.locks.props !== false;
+              if (document.getElementById('chkLockBackground')) document.getElementById('chkLockBackground').checked = Boolean(data.state.locks.background);
+            }
             document.getElementById('seedInput').value = data.state.seed ?? 42;
             if (data.state.outputSize) {
               document.getElementById('kontextSizeSelect').value = data.state.outputSize;
@@ -1497,6 +1730,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
             if (data.state.lastConfig) {
               document.getElementById('customJsonInput').value = JSON.stringify(data.state.lastConfig, null, 2);
             }
+            updateLabPromptPreview();
           }
         }
       } catch (err) {
@@ -1507,13 +1741,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     async function saveCurrentState() {
       const scene = document.getElementById('sceneInput').value;
       const outfit = document.getElementById('outfitInput').value;
+      const instruction = document.getElementById('instructionInput')?.value || '';
+      const locks = getEffectiveLocks();
       const outputSize = document.getElementById('kontextSizeSelect').value;
       const seed = parseInt(document.getElementById('seedInput').value, 10) || 42;
       try {
         await labFetch('/api/lab/state', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode: currentMode, scene, outfit, outputSize, seed })
+          body: JSON.stringify({ mode: currentMode, scene, outfit, instruction, locks, outputSize, seed })
         });
       } catch (err) {
         console.warn('Could not save state:', err);
@@ -1521,6 +1757,7 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
     }
     document.getElementById('sceneInput').addEventListener('blur', saveCurrentState);
     document.getElementById('outfitInput').addEventListener('blur', saveCurrentState);
+    document.getElementById('instructionInput')?.addEventListener('blur', saveCurrentState);
     document.getElementById('seedInput').addEventListener('blur', saveCurrentState);
 
     async function handlePhotoUpload(file) {
@@ -1803,6 +2040,13 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
               <input type="text" class="notes-input" placeholder="Add evaluation notes (likeness, skin, pores...)" value="\${notes.replace(/"/g, '&quot;')}" onblur="saveNotes('\${r.id}', this.value)" />
             </div>
 
+            \${(r.prompt || r.instruction) ? \`
+              <div style="font-size:0.75rem;background:#09090b;border:1px solid #27272a;padding:8px 10px;border-radius:8px;margin-bottom:8px;line-height:1.4;">
+                <span style="font-weight:700;color:var(--amber);">Prompt / Instruction:</span>
+                <div style="color:#d4d4d8;margin-top:2px;">\${escapeHtml(r.prompt || r.instruction)}</div>
+              </div>
+            \` : ''}
+
             <details style="font-size:0.75rem;">
               <summary style="cursor:pointer;color:var(--amber);font-weight:600;">Show Full Parameters JSON</summary>
               <pre class="code-box" style="padding:0.75rem;border-radius:8px;margin-top:6px;overflow-x:auto;">\${jsonStr}</pre>
@@ -2069,13 +2313,15 @@ router.get('/lab', labAuthMiddleware, (req, res) => {
       showError(null);
       const scene = document.getElementById('sceneInput').value;
       const outfit = document.getElementById('outfitInput').value;
+      const instruction = document.getElementById('instructionInput')?.value || '';
+      const locks = getEffectiveLocks();
       const outputSize = document.getElementById('kontextSizeSelect').value;
       const seed = parseInt(document.getElementById('seedInput').value, 10) || 42;
 
       const res = await labFetch('/api/lab/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preset, mode: currentMode, scene, outfit, outputSize, seed, customConfig })
+        body: JSON.stringify({ preset, mode: currentMode, scene, outfit, instruction, locks, outputSize, seed, customConfig })
       });
       const data = await res.json();
       if (!data.success) {
@@ -2318,8 +2564,8 @@ router.get('/api/lab/state', labAuthMiddleware, (req, res) => {
  */
 router.post('/api/lab/state', labAuthMiddleware, (req, res) => {
   try {
-    const { mode, scene, outfit, outputSize, seed, lastConfig } = req.body;
-    const updated = saveLabState({ mode, scene, outfit, outputSize, seed, lastConfig });
+    const { mode, scene, outfit, instruction, locks, outputSize, seed, lastConfig } = req.body;
+    const updated = saveLabState({ mode, scene, outfit, instruction, locks, outputSize, seed, lastConfig });
     res.json({ success: true, state: updated });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -2863,11 +3109,11 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     });
   }
 
-  const { preset, mode, scene, outfit, outputSize, seed, customConfig } = req.body;
+  const { preset, mode, scene, outfit, instruction, locks, outputSize, seed, customConfig } = req.body;
   const numSeed = parseInt(seed, 10) || 42;
 
   // REQUIREMENT 4: Deduplication: Ignore identical request within 10 seconds
-  const dedupKey = `${preset}_${numSeed}_${(scene || '').trim()}_${(outfit || '').trim()}_${mode}_${outputSize}`;
+  const dedupKey = `${preset}_${numSeed}_${(scene || '').trim()}_${(outfit || '').trim()}_${(instruction || '').trim()}_${mode}_${outputSize}`;
   const lastSubmittedTime = recentRunRequests.get(dedupKey);
   if (lastSubmittedTime && (Date.now() - lastSubmittedTime < 10000)) {
     console.warn(`[LAB DEDUP] Ignored duplicate run request for ${preset} (submitted ${Date.now() - lastSubmittedTime}ms ago)`);
@@ -2920,6 +3166,10 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     presetLabel = 'Preset H (Nano Banana Pro Edit, 2K)';
     initialModel = 'fal-ai/gemini-3-pro-image-preview/edit';
     initialCost = MODEL_PRICING['fal-ai/gemini-3-pro-image-preview/edit'];
+  } else if (preset === 'V2' || preset === 'v2') {
+    presetLabel = 'Production Pipeline v2 (Nano Banana + SeedVR2 2x)';
+    initialModel = 'fal-ai/nano-banana/edit';
+    initialCost = 0.044;
   } else if (preset === 'custom') {
     presetLabel = 'Custom Run';
     initialModel = customConfig?.model || 'fal-ai/flux-pulid';
@@ -2934,7 +3184,7 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     preset,
     presetLabel,
     model: initialModel,
-    params: { preset, mode, scene, outfit, outputSize, seed: numSeed },
+    params: { preset, mode, scene, outfit, instruction, locks, outputSize, seed: numSeed },
     seed: numSeed,
     runtime: '0.0s',
     cost: initialCost,
@@ -2967,6 +3217,8 @@ router.post('/api/lab/run', labAuthMiddleware, async (req, res) => {
     mode,
     scene,
     outfit,
+    instruction,
+    locks,
     outputSize,
     seed: numSeed,
     customConfig,

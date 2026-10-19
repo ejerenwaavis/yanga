@@ -1,5 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
-import { SCENE_CATEGORIES, SCENES } from './data/studioPresets.js';
+import { 
+  SCENE_CATEGORIES, 
+  SCENES, 
+  buildV2Prompt, 
+  CLOTHING_REGEX 
+} from './data/studioPresets.js';
 
 export default function App() {
   // ─── Authentication & SSO State ───────────────────────────────────────────
@@ -15,17 +20,26 @@ export default function App() {
   const [mfaToken, setMfaToken] = useState('');
   const [otp, setOtp] = useState('');
 
-  // ─── Studio Configuration State (Pipeline v2) ─────────────────────────────
+  // ─── Studio Configuration State (Pipeline v2 Composable UI) ───────────────
   // Step 1: Reference Photo
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
 
-  // Step 2: Scene Environment
-  const [activeCategory, setActiveCategory] = useState(SCENE_CATEGORIES[0].id);
-  const [selectedSceneId, setSelectedSceneId] = useState(SCENES[0].id);
+  // Step 2: Single Source of Truth Instruction Textarea
+  const [instruction, setInstruction] = useState(SCENES[0]?.starter || '');
+  const [highlightedSceneId, setHighlightedSceneId] = useState(SCENES[0]?.id || null);
 
-  // Step 3: Optional Outfit Instruction
-  const [customNotes, setCustomNotes] = useState('');
+  // Lock Toggles (Defaults per spec)
+  const [locks, setLocks] = useState({
+    outfit: true,
+    pose: true,
+    hair: true,
+    props: true,
+    background: false
+  });
+
+  const [showPromptPreview, setShowPromptPreview] = useState(false);
+  const [activeCategory, setActiveCategory] = useState(SCENE_CATEGORIES[0].id);
 
   // Generation & Polling State
   const [loading, setLoading] = useState(false);
@@ -197,9 +211,38 @@ export default function App() {
     }
   };
 
+  // ─── Scene & Instruction Handlers ─────────────────────────────────────────
+  // REQUIREMENT 2: Tapping a scene card fills the textarea with starter text and highlights the card.
+  // REQUIREMENT 4: Selecting a scene card turns Keep my background OFF automatically.
+  const handleSelectScene = (scene) => {
+    setInstruction(scene.starter);
+    setHighlightedSceneId(scene.id);
+    setLocks((prev) => ({ ...prev, background: false }));
+    setError(null);
+  };
+
+  // REQUIREMENT 2: If the user edits the text, remove the card highlight.
+  const handleInstructionChange = (e) => {
+    const text = e.target.value;
+    setInstruction(text);
+    const match = SCENES.find((s) => s.starter === text.trim());
+    setHighlightedSceneId(match ? match.id : null);
+    setError(null);
+  };
+
+  const toggleLock = (lockKey) => {
+    setLocks((prev) => ({ ...prev, [lockKey]: !prev[lockKey] }));
+  };
+
   // Filter scenes for currently active category tab
   const filteredScenes = SCENES.filter((s) => s.category === activeCategory);
-  const selectedScene = SCENES.find((s) => s.id === selectedSceneId) || SCENES[0];
+  const activeHighlightedScene = SCENES.find((s) => s.id === highlightedSceneId);
+
+  // Exact Canonical Prompt Preview
+  const exactFinalPrompt = buildV2Prompt(instruction, locks);
+
+  // Clothing mention check
+  const clothingMentioned = locks.outfit && CLOTHING_REGEX.test(instruction);
 
   // ─── Download Helper ──────────────────────────────────────────────────────
   const handleDownload = async (imageUrl, title) => {
@@ -225,8 +268,10 @@ export default function App() {
     const newResult = {
       id: resultData.jobId || Date.now().toString(),
       imageUrl: resultData.imageUrl,
-      sceneTitle: selectedScene.title,
-      prompt: selectedScene.scenePrompt + (customNotes.trim() ? ` (Outfit: ${customNotes.trim()})` : ''),
+      sceneTitle: activeHighlightedScene?.title || 'Custom Photoshoot',
+      instruction: resultData.instruction || instruction,
+      prompt: resultData.prompt || exactFinalPrompt,
+      locks: resultData.locks || locks,
       width: resultData.width,
       height: resultData.height,
       upscaled: resultData.upscaled,
@@ -276,14 +321,14 @@ export default function App() {
           setLoading(false);
         } else {
           // Dynamic stage feedback
-          if (data.stage === 'editing') {
-            setLoadingStage('Replacing background with Nano Banana...');
-          } else if (data.stage === 'upscaling') {
+          if (data.stage === 'editing_background') {
+            setLoadingStage('Synthesizing photoshoot with Nano Banana...');
+          } else if (data.stage === 'upscaling_2x') {
             setLoadingStage('Super-resolution 2x upscale with SeedVR2...');
           } else if (data.stage === 'queued') {
             setLoadingStage('Queued in studio processing pipeline...');
           } else {
-            setLoadingStage('Synthesizing photoshoot...');
+            setLoadingStage('Processing photoshoot...');
           }
         }
       } catch (pollErr) {
@@ -300,16 +345,22 @@ export default function App() {
       return;
     }
 
+    // REQUIREMENT 7: If the textarea is empty, block submit with "Describe the scene or change you want."
+    const cleanInstruction = instruction.trim();
+    if (!cleanInstruction) {
+      setError('Describe the scene or change you want.');
+      return;
+    }
+
     setLoading(true);
     setLoadingStage('Queuing photoshoot...');
     setError(null);
 
+    // REQUIREMENT 8: Send only { instruction, locks } plus the image
     const formData = new FormData();
     formData.append('image', file);
-    formData.append('scene', selectedScene.scenePrompt);
-    if (customNotes.trim()) {
-      formData.append('outfit', customNotes.trim());
-    }
+    formData.append('instruction', cleanInstruction);
+    formData.append('locks', JSON.stringify(locks));
 
     try {
       const response = await fetch('/api/generate', {
@@ -567,7 +618,7 @@ export default function App() {
           Yanga <span className="text-amber-500">Studio</span>
         </h1>
         <p className="text-neutral-400 text-xs md:text-sm">
-          Seamless natural background substitution and 2x super-resolution. Keeps your authentic face, hair, and desk items identical to the original photo.
+          Seamless natural background substitution and 2x super-resolution. Keeps your authentic face, skin tone, hair, and pose identical to your original photo.
         </p>
       </header>
 
@@ -593,14 +644,14 @@ export default function App() {
             <div className="border-2 border-dashed border-neutral-700 hover:border-amber-500/60 rounded-xl p-3 transition-colors text-center relative bg-neutral-950/40">
               {previewUrl ? (
                 <div className="relative group rounded-lg overflow-hidden flex items-center justify-center bg-black/40">
-                  <img src={previewUrl} alt="Reference Preview" className="h-48 object-contain rounded-lg" />
+                  <img src={previewUrl} alt="Reference Preview" className="h-44 object-contain rounded-lg" />
                   <label className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center text-xs font-medium text-amber-400 cursor-pointer rounded-lg transition-opacity">
                     Click to change photo
                     <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleFileChange} className="hidden" />
                   </label>
                 </div>
               ) : (
-                <label className="cursor-pointer block py-8">
+                <label className="cursor-pointer block py-7">
                   <div className="text-amber-500 text-3xl mb-1.5">📸</div>
                   <span className="text-xs font-medium text-neutral-300 block">Upload your portrait or workspace photo</span>
                   <p className="text-[11px] text-neutral-500 mt-1">JPEG, PNG, or WebP up to 10MB • Output dimensions match original</p>
@@ -610,12 +661,168 @@ export default function App() {
             </div>
           </div>
 
-          {/* ─── STEP 2: Scene Environment ─────────────────────────────── */}
+          {/* ─── STEP 2: Describe Your Photo (Single Source of Truth) ───── */}
           <div className="border-t border-neutral-800 pt-5">
-            <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2 mb-3">
-              <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">2</span>
-              <span>Scene Environment</span>
-            </label>
+            <div className="flex items-center justify-between mb-2">
+              <label htmlFor="instructionField" className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">2</span>
+                <span>Describe your photo</span>
+              </label>
+              <span className="text-[10px] text-neutral-400">Single source of truth</span>
+            </div>
+
+            {/* Editable Textarea: Instruction */}
+            <textarea
+              id="instructionField"
+              value={instruction}
+              onChange={handleInstructionChange}
+              rows={3}
+              placeholder="e.g. Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows."
+              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 text-xs p-3.5 rounded-xl outline-none focus:border-amber-500 transition-colors leading-relaxed resize-y"
+            />
+
+            {/* REQUIREMENT 5: Clothing hint when instruction mentions clothing and Keep my outfit is ON */}
+            {clothingMentioned && (
+              <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-2 mt-2">
+                <span className="flex items-center gap-1.5">
+                  <span>💡</span>
+                  <span>You described an outfit. Turn off Keep my outfit to change it.</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setLocks((prev) => ({ ...prev, outfit: false }))}
+                  className="text-[11px] font-bold bg-amber-500 text-neutral-950 px-2 py-0.5 rounded hover:bg-amber-400 whitespace-nowrap transition-colors"
+                >
+                  Turn Off
+                </button>
+              </div>
+            )}
+
+            {/* REQUIREMENT 4: Lock Toggles under the textarea */}
+            <div className="mt-4 pt-3 border-t border-neutral-800/80">
+              <div className="flex items-center justify-between mb-2.5 flex-wrap gap-1">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-neutral-400">
+                  Keep Rules & Locks
+                </span>
+                <span className="text-[10px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded flex items-center gap-1">
+                  🔒 Face is always locked
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {/* Lock 1: Outfit */}
+                <button
+                  type="button"
+                  onClick={() => toggleLock('outfit')}
+                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                    locks.outfit
+                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  <span className="text-[11px] font-medium">Keep my outfit</span>
+                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.outfit ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                    {locks.outfit ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+
+                {/* Lock 2: Pose */}
+                <button
+                  type="button"
+                  onClick={() => toggleLock('pose')}
+                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                    locks.pose
+                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  <span className="text-[11px] font-medium">Keep my pose</span>
+                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.pose ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                    {locks.pose ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+
+                {/* Lock 3: Hair */}
+                <button
+                  type="button"
+                  onClick={() => toggleLock('hair')}
+                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                    locks.hair
+                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  <span className="text-[11px] font-medium">Keep my hair</span>
+                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.hair ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                    {locks.hair ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+
+                {/* Lock 4: Props and objects */}
+                <button
+                  type="button"
+                  onClick={() => toggleLock('props')}
+                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                    locks.props
+                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  <span className="text-[11px] font-medium">Keep props/objects</span>
+                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.props ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                    {locks.props ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+
+                {/* Lock 5: Background */}
+                <button
+                  type="button"
+                  onClick={() => toggleLock('background')}
+                  className={`p-2 rounded-lg text-left border text-xs transition-all flex items-center justify-between ${
+                    locks.background
+                      ? 'border-amber-500/80 bg-amber-500/15 text-amber-300'
+                      : 'border-neutral-800 bg-neutral-950/60 text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  <span className="text-[11px] font-medium">Keep background</span>
+                  <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${locks.background ? 'bg-amber-500 text-neutral-950' : 'bg-neutral-800 text-neutral-400'}`}>
+                    {locks.background ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* REQUIREMENT 6: Collapsed Prompt Preview */}
+            <div className="mt-3.5">
+              <button
+                type="button"
+                onClick={() => setShowPromptPreview(!showPromptPreview)}
+                className="text-[11px] text-neutral-400 hover:text-amber-400 flex items-center gap-1 transition-colors"
+              >
+                <span>{showPromptPreview ? '▾ Hide' : '▸ Preview'} exact final prompt</span>
+              </button>
+
+              {showPromptPreview && (
+                <div className="mt-2 p-3 rounded-xl bg-black/80 border border-neutral-800 font-mono text-[11px] text-amber-200/90 leading-relaxed break-words shadow-inner">
+                  {exactFinalPrompt}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* ─── STEP 3: Scene Inspiration (Tap to load starter text) ──── */}
+          <div className="border-t border-neutral-800 pt-5">
+            <div className="flex items-center justify-between mb-3">
+              <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">3</span>
+                <span>Scene Inspiration (Tap to fill instruction)</span>
+              </label>
+              {highlightedSceneId && (
+                <span className="text-[10px] text-amber-400 font-semibold">
+                  Card highlighted
+                </span>
+              )}
+            </div>
 
             {/* Horizontal Scrollable Category Tabs */}
             <div className="flex gap-2 overflow-x-auto pb-2 scrollbar-thin">
@@ -623,11 +830,7 @@ export default function App() {
                 <button
                   key={c.id}
                   type="button"
-                  onClick={() => {
-                    setActiveCategory(c.id);
-                    const firstInCat = SCENES.find((s) => s.category === c.id);
-                    if (firstInCat) setSelectedSceneId(firstInCat.id);
-                  }}
+                  onClick={() => setActiveCategory(c.id)}
                   className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-colors ${
                     activeCategory === c.id
                       ? 'bg-amber-500 text-neutral-950 font-bold'
@@ -642,51 +845,33 @@ export default function App() {
             {/* Filtered Scene Cards */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 mt-3">
               {filteredScenes.map((s) => {
-                const active = selectedSceneId === s.id;
+                const isHighlighted = highlightedSceneId === s.id;
                 return (
                   <button
                     key={s.id}
                     type="button"
-                    onClick={() => setSelectedSceneId(s.id)}
+                    onClick={() => handleSelectScene(s)}
                     className={`text-left p-3 rounded-xl border text-xs transition-all flex flex-col justify-between ${
-                      active
-                        ? 'border-amber-500 bg-amber-500/10 text-white shadow-sm ring-1 ring-amber-500/30'
+                      isHighlighted
+                        ? 'border-amber-500 bg-amber-500/15 text-white shadow-sm ring-1 ring-amber-500/40'
                         : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
                     }`}
                   >
                     <div>
-                      <div className={active ? 'text-amber-400 font-bold' : 'text-neutral-200 font-medium'}>
+                      <div className={isHighlighted ? 'text-amber-400 font-bold' : 'text-neutral-200 font-medium'}>
                         {s.title}
                       </div>
                       <div className="text-[11px] text-neutral-500 mt-1 line-clamp-2">
                         {s.subtitle}
                       </div>
                     </div>
-                    {active && (
-                      <span className="text-[10px] text-amber-400 font-bold mt-2">Selected ✓</span>
+                    {isHighlighted && (
+                      <span className="text-[10px] text-amber-400 font-bold mt-2">Active Starter ✓</span>
                     )}
                   </button>
                 );
               })}
             </div>
-          </div>
-
-          {/* ─── STEP 3: Outfit & Wardrobe Change (Optional) ──────────── */}
-          <div className="border-t border-neutral-800 pt-5">
-            <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2 mb-1.5">
-              <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">3</span>
-              <span>Outfit & Wardrobe Change (Optional)</span>
-            </label>
-            <p className="text-[11px] text-neutral-500 mb-2">
-              Leave blank to keep your exact original outfit, desk, laptop, and surrounding items intact.
-            </p>
-            <input
-              type="text"
-              value={customNotes}
-              onChange={(e) => setCustomNotes(e.target.value)}
-              placeholder="e.g. emerald velvet dinner jacket, crisp white collar shirt"
-              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-200 text-xs p-3 rounded-xl outline-none focus:border-amber-500"
-            />
           </div>
 
           {/* Error Notice */}
@@ -700,7 +885,7 @@ export default function App() {
           {/* Submit Action Button */}
           <button
             type="submit"
-            disabled={loading || !file}
+            disabled={loading || !file || !instruction.trim()}
             className="w-full bg-amber-500 text-neutral-950 font-bold py-3.5 px-4 rounded-xl hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-lg shadow-amber-500/10 flex items-center justify-center gap-2"
           >
             {loading ? (
@@ -709,7 +894,7 @@ export default function App() {
                 <span>{loadingStage}</span>
               </>
             ) : (
-              <span>Shoot Photoshoot ({selectedScene.title})</span>
+              <span>Shoot Photoshoot</span>
             )}
           </button>
         </form>
@@ -748,7 +933,7 @@ export default function App() {
                 </div>
                 <img
                   src={activeResult.imageUrl}
-                  alt={activeResult.prompt || 'Generated Photoshoot'}
+                  alt={activeResult.instruction || activeResult.prompt || 'Generated Photoshoot'}
                   className="w-full max-h-[520px] object-cover rounded-xl shadow-2xl border-2 border-neutral-800"
                 />
               </div>
@@ -768,7 +953,7 @@ export default function App() {
                 <div className="text-5xl mb-3 opacity-30">✨</div>
                 <h3 className="text-sm font-semibold text-neutral-400 mb-1">Studio Viewport Empty</h3>
                 <p className="text-xs text-neutral-600 max-w-xs">
-                  Upload your photo and click "Shoot Photoshoot" to see your photorealistic editorial portrait here.
+                  Upload your photo, describe your desired photoshoot scene, and click "Shoot Photoshoot" to see your photorealistic editorial portrait here.
                 </p>
               </div>
             )}
@@ -801,8 +986,8 @@ export default function App() {
                       <img src={r.imageUrl} alt={r.sceneTitle} className="w-16 h-16 object-cover rounded-lg flex-shrink-0 border border-neutral-800" />
                       <div className="min-w-0">
                         <div className="text-xs font-semibold text-neutral-200 truncate">{r.sceneTitle}</div>
-                        <div className="text-[10px] text-neutral-500 mt-0.5">
-                          {new Date(r.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        <div className="text-[10px] text-neutral-500 mt-0.5 truncate max-w-xs">
+                          {r.instruction || (new Date(r.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))}
                           {r.width && r.height ? ` • ${r.width}×${r.height}` : ''}
                         </div>
                         <div className="text-[9px] text-neutral-400 mt-1 inline-block">
