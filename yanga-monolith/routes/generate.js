@@ -3,9 +3,12 @@ import multer from 'multer';
 import sharp from 'sharp';
 import path from 'path';
 import fs from 'fs';
-import archiver from 'archiver';
+import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { fal } from '@fal-ai/client';
+
+const require = createRequire(import.meta.url);
+const archiver = require('archiver');
 import { 
   uploadReferenceImage, 
   uploadGeneratedImage, 
