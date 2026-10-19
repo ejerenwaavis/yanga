@@ -1,0 +1,235 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "app": "Yanga Studio",
+  "version": "2.0.0",
+  "pipeline": "Pipeline v2 (Nano Banana Edit + SeedVR2 2x Super-Resolution)",
+  "exportedAt": "2026-10-19T17:15:00.000Z",
+  "categories": [
+    {
+      "id": "all",
+      "label": "All",
+      "description": "Displays all available scenes across all categories."
+    },
+    {
+      "id": "celebration",
+      "label": "Birthday & Luxe",
+      "description": "High-end celebration, luxury penthouse, gala, and birthday editorial portraits."
+    },
+    {
+      "id": "beach",
+      "label": "Beach & Resort",
+      "description": "Coastal getaways, open ocean yacht decks, and shaded tropical resort lounges."
+    },
+    {
+      "id": "owambe",
+      "label": "Owambe & Cultural",
+      "description": "Opulent Nigerian wedding ballrooms, regal traditional heritage, and contemporary African chic."
+    },
+    {
+      "id": "lifestyle",
+      "label": "Travel & Studio",
+      "description": "European luxury city streets, corporate high-rise corner offices, and classic portrait studios."
+    }
+  ],
+  "scenes": [
+    {
+      "id": "penthouse_birthday",
+      "category": "celebration",
+      "categoryLabel": "Birthday & Luxe",
+      "title": "Penthouse Birthday Editorial",
+      "subtitle": "Midnight luxury penthouse suite with city skyline view",
+      "starterInstruction": "Place me in a luxury glass penthouse suite overlooking a glittering city night skyline with ambient chandelier lighting and celebratory golden atmosphere.",
+      "tags": ["luxury", "night", "skyline", "city", "celebration", "chandelier", "indoor"]
+    },
+    {
+      "id": "rooftop_toast",
+      "category": "celebration",
+      "categoryLabel": "Birthday & Luxe",
+      "title": "Golden Hour Rooftop Toast",
+      "subtitle": "Sun-drenched luxury terrace with warm sunset flare",
+      "starterInstruction": "Place me on an exclusive private rooftop garden terrace at golden hour with soft warm backlight and a blurred urban panoramic skyline.",
+      "tags": ["rooftop", "golden hour", "sunset", "terrace", "celebration", "outdoor"]
+    },
+    {
+      "id": "vogue_birthday",
+      "category": "celebration",
+      "categoryLabel": "Birthday & Luxe",
+      "title": "Vogue Birthday Portrait",
+      "subtitle": "High-concept fashion studio with subtle golden accents",
+      "starterInstruction": "Place me in a high-end editorial fashion studio with subtle sculpted metallic gold balloon arrangements and minimalist floral set design.",
+      "tags": ["studio", "fashion", "vogue", "editorial", "minimalist", "gold", "balloons"]
+    },
+    {
+      "id": "coastline_sunset",
+      "category": "beach",
+      "categoryLabel": "Beach & Resort",
+      "title": "Golden Coastline Sunset",
+      "subtitle": "Warm coastal breezes and cinematic sunset colors",
+      "starterInstruction": "Place me along a private tropical coastline at sunset with gentle ocean breeze, pastel skies, and soft turquoise water reflections.",
+      "tags": ["beach", "coastline", "sunset", "tropical", "ocean", "outdoor", "golden hour"]
+    },
+    {
+      "id": "yacht_deck",
+      "category": "beach",
+      "categoryLabel": "Beach & Resort",
+      "title": "Private Yacht Deck",
+      "subtitle": "Mediterranean open sea luxury with crisp sunlit horizon",
+      "starterInstruction": "Place me on the polished teak deck of a luxury superyacht cruising open deep blue ocean waters under bright natural daylight.",
+      "tags": ["yacht", "ocean", "mediterranean", "boat", "luxury", "daylight", "outdoor"]
+    },
+    {
+      "id": "cabana_lounge",
+      "category": "beach",
+      "categoryLabel": "Beach & Resort",
+      "title": "Resort Cabana Lounge",
+      "subtitle": "Shaded tropical cabana with palm leaf shadows and teak wood",
+      "starterInstruction": "Place me in an exclusive shaded oceanfront cabana at a five-star private island resort with teak wood furnishings and tropical palm shadows.",
+      "tags": ["resort", "cabana", "tropical", "palm trees", "island", "teak", "relaxation"]
+    },
+    {
+      "id": "royal_owambe",
+      "category": "owambe",
+      "categoryLabel": "Owambe & Cultural",
+      "title": "Royal Owambe Reception",
+      "subtitle": "Aso-Ebi luxury banquet with crystal chandelier bokeh",
+      "starterInstruction": "Place me at an opulent Lagos wedding reception ballroom with dazzling crystal chandelier bokeh and warm festive banquet ambient lighting.",
+      "tags": ["owambe", "wedding", "lagos", "banquet", "chandelier", "aso-ebi", "indoor"]
+    },
+    {
+      "id": "traditional_heritage",
+      "category": "owambe",
+      "categoryLabel": "Owambe & Cultural",
+      "title": "Traditional Heritage Portrait",
+      "subtitle": "Regal heritage portrait studio with warm dramatic lighting",
+      "starterInstruction": "Place me in a timeless royal heritage portrait studio with warm Rembrandt key lighting and rich textured shadowed backdrop.",
+      "tags": ["heritage", "traditional", "royal", "rembrandt", "portrait studio", "regal"]
+    },
+    {
+      "id": "contemporary_trad",
+      "category": "owambe",
+      "categoryLabel": "Owambe & Cultural",
+      "title": "Contemporary Trad Chic",
+      "subtitle": "Victoria Island courtyard with tropical greenery",
+      "starterInstruction": "Place me in a modern architectural courtyard in Victoria Island Lagos surrounded by lush tropical greenery and minimalist stone walls.",
+      "tags": ["victoria island", "lagos", "architecture", "courtyard", "greenery", "contemporary"]
+    },
+    {
+      "id": "mayfair_street",
+      "category": "lifestyle",
+      "categoryLabel": "Travel & Studio",
+      "title": "London Mayfair Street",
+      "subtitle": "European luxury boutique street scene",
+      "starterInstruction": "Place me on a cobbled London street in Mayfair at golden hour, with warm lit shop windows.",
+      "tags": ["london", "mayfair", "street", "europe", "golden hour", "boutique", "urban"]
+    },
+    {
+      "id": "corner_office",
+      "category": "lifestyle",
+      "categoryLabel": "Travel & Studio",
+      "title": "Executive Corner Office",
+      "subtitle": "High-rise executive office with panoramic glass windows",
+      "starterInstruction": "Place me in a sleek modern high-rise executive corner office with floor-to-ceiling panoramic glass windows overlooking a city skyline.",
+      "tags": ["office", "corporate", "executive", "skyline", "modern", "interior"]
+    },
+    {
+      "id": "charcoal_studio",
+      "category": "lifestyle",
+      "categoryLabel": "Travel & Studio",
+      "title": "Classic Charcoal Studio",
+      "subtitle": "Timeless studio portrait with textured charcoal canvas",
+      "starterInstruction": "Place me in an elite portrait studio against a hand-painted textured charcoal canvas backdrop with soft dramatic studio key lighting.",
+      "tags": ["studio", "charcoal", "canvas", "portrait", "classic", "fine art"]
+    }
+  ],
+  "keepLocks": {
+    "face": {
+      "label": "Face & Identity",
+      "default": true,
+      "immutable": true,
+      "phrase": "Keep the person's face, skin tone, facial features, expression and body proportions exactly identical to the photo",
+      "description": "Always enforced in every generation. Not exposed as a toggle to the user."
+    },
+    "outfit": {
+      "label": "Keep my outfit",
+      "default": true,
+      "toggleable": true,
+      "phrase": "same outfit",
+      "description": "Preserves original clothing verbatim. If OFF, allows changing garments based on instruction."
+    },
+    "pose": {
+      "label": "Keep my pose",
+      "default": true,
+      "toggleable": true,
+      "phrase": "same pose",
+      "description": "Locks head angle, body posture, arm placement, and orientation."
+    },
+    "hair": {
+      "label": "Keep my hair",
+      "default": true,
+      "toggleable": true,
+      "phrase": "same hair",
+      "description": "Preserves hairstyle, edges, texture, length, and color."
+    },
+    "props": {
+      "label": "Keep props and objects",
+      "default": true,
+      "toggleable": true,
+      "phrase": "same props and objects",
+      "description": "Preserves glasses, watch, laptop, phones, jewelry, and desk items from the original image."
+    },
+    "background": {
+      "label": "Keep background",
+      "default": false,
+      "toggleable": true,
+      "phrase": "same background",
+      "description": "Automatically turned OFF whenever a scene preset is tapped."
+    }
+  },
+  "canonicalPromptComposer": {
+    "formula": "Edit this photo: {instruction}. Keep the person's face, skin tone, facial features, expression and body proportions exactly identical to the photo[, plus enabled locks]. If my request conflicts with a keep rule, follow my request. No readable text, signs or logos in the background. Clean sky with no stray shapes. Natural unretouched photo.",
+    "conflictResolution": "If user prompt specifies clothing while 'Keep my outfit' is ON, the app triggers a UI warning banner asking the user to turn off the outfit lock.",
+    "clothingDetectionKeywords": [
+      "outfit", "wearing", "dressed", "jacket", "suit", "blazer", "dress", "tuxedo", 
+      "shirt", "jeans", "pants", "trousers", "sweater", "hoodie", "coat", "overcoat", 
+      "skirt", "robe", "gown", "attire", "garment", "aso-ebi", "agbada", "ankara", 
+      "kaftan", "senator", "blouse", "tie", "bow-tie"
+    ]
+  },
+  "modelPipeline": {
+    "winningPipeline": {
+      "name": "Pipeline v2",
+      "step1_downscale": {
+        "engine": "sharp",
+        "maxDimension": 2048,
+        "format": "jpeg",
+        "quality": 95
+      },
+      "step2_synthesis": {
+        "modelId": "fal-ai/nano-banana/edit",
+        "input": "image_urls: [cdn_url], prompt: canonicalPrompt",
+        "estimatedCost": "$0.039"
+      },
+      "step3_upscale": {
+        "modelId": "fal-ai/seedvr/upscale/image",
+        "factor": 2,
+        "estimatedCost": "$0.005",
+        "fallback": "Retains Step 2 output if upscale fails"
+      }
+    },
+    "alternativeModelsEvaluated": [
+      { "id": "A", "name": "Flux-Pro Kontext", "model": "fal-ai/flux-pro/v1/fill", "cost": "$0.050" },
+      { "id": "B", "name": "PuLID 0.9", "model": "fal-ai/flux-pulid", "cost": "$0.045" },
+      { "id": "C", "name": "PuLID 0.8 Natural", "model": "fal-ai/flux-pulid", "cost": "$0.045" },
+      { "id": "D", "name": "Kontext + Upscale + Grain", "model": "fal-ai/flux-pro/v1/fill + clarity", "cost": "$0.160" },
+      { "id": "F", "name": "Seedream Edit", "model": "fal-ai/bytedance/seedream/edit", "cost": "$0.040" },
+      { "id": "G", "name": "Nano Banana 2 Edit (2K)", "model": "fal-ai/nano-banana-2/edit", "cost": "$0.120" },
+      { "id": "H", "name": "Nano Banana Pro Edit (2K)", "model": "fal-ai/gemini-3-pro-image-preview/edit", "cost": "$0.150" }
+    ]
+  },
+  "aspectRatios": [
+    { "id": "match_original", "label": "Original Ratio (Default)", "description": "Preserves uploaded photo aspect ratio" },
+    { "id": "ig_feed_4_5", "label": "Instagram Feed (4:5)", "width": 1080, "height": 1350 },
+    { "id": "story_9_16", "label": "Story / TikTok (9:16)", "width": 1080, "height": 1920 },
+    { "id": "square_hd", "label": "Square (1:1)", "width": 1080, "height": 1080 }
+  ]
+}
