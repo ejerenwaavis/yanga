@@ -1,12 +1,5 @@
-import { useState, useEffect } from 'react';
-import { 
-  SCENE_CATEGORIES, 
-  SCENES, 
-  SUBJECT_TYPES, 
-  HAIRSTYLES, 
-  FRAMING_OPTIONS, 
-  ASPECT_RATIOS 
-} from './data/studioPresets.js';
+import { useState, useEffect, useRef } from 'react';
+import { SCENE_CATEGORIES, SCENES } from './data/studioPresets.js';
 
 export default function App() {
   // ─── Authentication & SSO State ───────────────────────────────────────────
@@ -22,30 +15,26 @@ export default function App() {
   const [mfaToken, setMfaToken] = useState('');
   const [otp, setOtp] = useState('');
 
-  // ─── Studio Configuration State ───────────────────────────────────────────
-  // Step 1: Reference
+  // ─── Studio Configuration State (Pipeline v2) ─────────────────────────────
+  // Step 1: Reference Photo
   const [file, setFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
 
-  // Step 2: Subject & Framing Calibration
-  const [subjectType, setSubjectType] = useState(SUBJECT_TYPES[0].id);
-  const [hairStyle, setHairStyle] = useState(HAIRSTYLES[0].id);
-  const [framing, setFraming] = useState(FRAMING_OPTIONS[0].id);
-  const [aspectRatio, setAspectRatio] = useState(ASPECT_RATIOS[0].id);
-
-  // Step 3: Scene Space & Fine-Tuning
+  // Step 2: Scene Environment
   const [activeCategory, setActiveCategory] = useState(SCENE_CATEGORIES[0].id);
   const [selectedSceneId, setSelectedSceneId] = useState(SCENES[0].id);
-  const [customNotes, setCustomNotes] = useState('');
-  const [showFineTune, setShowFineTune] = useState(false);
-  const [idWeight, setIdWeight] = useState(1.0);
-  const [startStep, setStartStep] = useState(1);
 
-  // Generation & Output State
+  // Step 3: Optional Outfit Instruction
+  const [customNotes, setCustomNotes] = useState('');
+
+  // Generation & Polling State
   const [loading, setLoading] = useState(false);
+  const [loadingStage, setLoadingStage] = useState('Queuing photoshoot...');
   const [error, setError] = useState(null);
   const [results, setResults] = useState([]);
   const [activeResult, setActiveResult] = useState(null);
+
+  const pollTimerRef = useRef(null);
 
   // User's private Cloudinary photoshoot vault
   const [history, setHistory] = useState(() => {
@@ -60,6 +49,9 @@ export default function App() {
   // ─── Auth Lifecycle ───────────────────────────────────────────────────────
   useEffect(() => {
     checkSession();
+    return () => {
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+    };
   }, []);
 
   const checkSession = async () => {
@@ -195,6 +187,10 @@ export default function App() {
   const handleFileChange = (e) => {
     const selected = e.target.files[0];
     if (selected) {
+      if (selected.size > 10 * 1024 * 1024) {
+        setError('Image file is too large. Please select a photo under 10MB.');
+        return;
+      }
       setFile(selected);
       setPreviewUrl(URL.createObjectURL(selected));
       setError(null);
@@ -205,27 +201,115 @@ export default function App() {
   const filteredScenes = SCENES.filter((s) => s.category === activeCategory);
   const selectedScene = SCENES.find((s) => s.id === selectedSceneId) || SCENES[0];
 
+  // ─── Download Helper ──────────────────────────────────────────────────────
+  const handleDownload = async (imageUrl, title) => {
+    try {
+      const res = await fetch(imageUrl);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      const safeName = (title || 'yanga-photoshoot').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      link.download = `${safeName}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch {
+      window.open(imageUrl, '_blank');
+    }
+  };
+
+  // ─── Generation Completion Handler ────────────────────────────────────────
+  const handleGenerationSuccess = (resultData) => {
+    const newResult = {
+      id: resultData.jobId || Date.now().toString(),
+      imageUrl: resultData.imageUrl,
+      sceneTitle: selectedScene.title,
+      prompt: selectedScene.scenePrompt + (customNotes.trim() ? ` (Outfit: ${customNotes.trim()})` : ''),
+      width: resultData.width,
+      height: resultData.height,
+      upscaled: resultData.upscaled,
+      seed: resultData.seed,
+      createdAt: resultData.createdAt || new Date().toISOString()
+    };
+
+    setResults((prev) => [newResult, ...prev]);
+    setActiveResult(newResult);
+
+    // Persist to user history
+    setHistory((prev) => {
+      const next = [newResult, ...prev.filter((x) => x.imageUrl !== newResult.imageUrl)];
+      localStorage.setItem('yanga_history', JSON.stringify(next));
+      return next;
+    });
+  };
+
+  // ─── Poll Job Status ──────────────────────────────────────────────────────
+  const pollJobStatus = (jobId) => {
+    const startTime = Date.now();
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+
+    pollTimerRef.current = setInterval(async () => {
+      // 180s client timeout guard
+      if (Date.now() - startTime > 190000) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+        setError('Photoshoot generation timed out after 3 minutes. Please try again.');
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/generate/status/${jobId}`, { credentials: 'include' });
+        const data = await res.json();
+
+        if (data.status === 'done' && data.result) {
+          clearInterval(pollTimerRef.current);
+          pollTimerRef.current = null;
+          handleGenerationSuccess(data.result);
+          setLoading(false);
+        } else if (data.status === 'error') {
+          clearInterval(pollTimerRef.current);
+          pollTimerRef.current = null;
+          setError(data.error || 'Photoshoot generation failed.');
+          setLoading(false);
+        } else {
+          // Dynamic stage feedback
+          if (data.stage === 'editing') {
+            setLoadingStage('Replacing background with Nano Banana...');
+          } else if (data.stage === 'upscaling') {
+            setLoadingStage('Super-resolution 2x upscale with SeedVR2...');
+          } else if (data.stage === 'queued') {
+            setLoadingStage('Queued in studio processing pipeline...');
+          } else {
+            setLoadingStage('Synthesizing photoshoot...');
+          }
+        }
+      } catch (pollErr) {
+        console.warn('Job status poll notice:', pollErr);
+      }
+    }, 3000);
+  };
+
   // ─── Submit Photoshoot Request ───────────────────────────────────────────
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!file) {
-      setError('Please upload a clear selfie first in Step 1.');
+      setError('Please upload a clear reference photo first.');
       return;
     }
 
     setLoading(true);
+    setLoadingStage('Queuing photoshoot...');
     setError(null);
-
-    // Prompt construction: Framing + Subject + Hair + Scene Prompt + Custom Notes
-    const customAddition = customNotes.trim() ? `, ${customNotes.trim()}` : '';
-    const constructedPrompt = `${framing} of a ${subjectType}, ${hairStyle}, ${selectedScene.scenePrompt}${customAddition}`;
 
     const formData = new FormData();
     formData.append('image', file);
-    formData.append('prompt', constructedPrompt);
-    formData.append('aspect_ratio', aspectRatio);
-    formData.append('id_weight', idWeight);
-    formData.append('start_step', startStep);
+    formData.append('scene', selectedScene.scenePrompt);
+    if (customNotes.trim()) {
+      formData.append('outfit', customNotes.trim());
+    }
 
     try {
       const response = await fetch('/api/generate', {
@@ -238,37 +322,39 @@ export default function App() {
       if (response.status === 401) {
         setUser(null);
         setError('Your session has expired. Please log in again.');
+        setLoading(false);
         return;
       }
 
-      if (data.success && data.imageUrl) {
-        const newResult = {
-          id: data.publicId || Date.now().toString(),
-          imageUrl: data.imageUrl,
-          referenceUrl: data.referenceUrl,
-          sceneTitle: selectedScene.title,
-          prompt: constructedPrompt,
-          seed: data.seed,
-          createdAt: data.createdAt || new Date().toISOString()
-        };
+      if (response.status === 429) {
+        setError(data.error || 'Rate limit reached or duplicate request.');
+        setLoading(false);
+        return;
+      }
 
-        // Prepend to current session results
-        setResults((prev) => [newResult, ...prev]);
-        setActiveResult(newResult);
+      if (!response.ok || !data.success) {
+        setError(data.error || 'Generation failed. Please try again.');
+        setLoading(false);
+        return;
+      }
 
-        // Prepend to persistent history vault
-        setHistory((prev) => {
-          const next = [newResult, ...prev.filter((x) => x.imageUrl !== newResult.imageUrl)];
-          localStorage.setItem('yanga_history', JSON.stringify(next));
-          return next;
-        });
+      // Legacy fallback response (returns imageUrl directly)
+      if (data.imageUrl) {
+        handleGenerationSuccess(data);
+        setLoading(false);
+        return;
+      }
+
+      // Pipeline v2 background job response
+      if (data.jobId) {
+        pollJobStatus(data.jobId);
       } else {
-        setError(data.error || 'Generation failed. Please check your credit balance.');
+        setError('Unexpected server response: missing job tracking ID.');
+        setLoading(false);
       }
     } catch (err) {
       console.error(err);
       setError('Network connection failed. Make sure the server is reachable.');
-    } finally {
       setLoading(false);
     }
   };
@@ -475,31 +561,31 @@ export default function App() {
       {/* Studio Header */}
       <header className="text-center max-w-2xl mb-8">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold tracking-wide uppercase mb-3">
-          Optical Realism • FLUX + PuLID Engine
+          Optical Realism • Nano Banana + SeedVR2 HD
         </div>
         <h1 className="text-4xl md:text-5xl font-black tracking-tight text-white mb-2">
           Yanga <span className="text-amber-500">Studio</span>
         </h1>
         <p className="text-neutral-400 text-xs md:text-sm">
-          High-fidelity authentic photoshoot generator with true skin micro-texture, depth of field, and natural lighting physics.
+          Seamless natural background substitution and 2x super-resolution. Keeps your authentic face, hair, and desk items identical to the original photo.
         </p>
       </header>
 
       {/* Main Studio Workspace */}
       <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Left Column: Interactive 3-Step Controls (7 cols) */}
+        {/* Left Column: Studio Controls (7 cols) */}
         <form onSubmit={handleSubmit} className="lg:col-span-7 bg-neutral-900/90 border border-neutral-800 rounded-2xl p-5 md:p-7 shadow-2xl flex flex-col gap-6">
           
-          {/* ─── STEP 1: Reference Selfie Dropzone ─────────────────────── */}
+          {/* ─── STEP 1: Reference Photo Dropzone ─────────────────────── */}
           <div>
             <div className="flex items-center justify-between mb-2">
               <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2">
                 <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">1</span>
-                <span>Reference Selfie</span>
+                <span>Reference Photo</span>
               </label>
               {file && (
                 <span className="text-[11px] font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-800/80 px-2 py-0.5 rounded-md flex items-center gap-1">
-                  Face Ready ✓
+                  Photo Ready ✓
                 </span>
               )}
             </div>
@@ -507,106 +593,27 @@ export default function App() {
             <div className="border-2 border-dashed border-neutral-700 hover:border-amber-500/60 rounded-xl p-3 transition-colors text-center relative bg-neutral-950/40">
               {previewUrl ? (
                 <div className="relative group rounded-lg overflow-hidden flex items-center justify-center bg-black/40">
-                  <img src={previewUrl} alt="Selfie Preview" className="h-44 object-contain rounded-lg" />
+                  <img src={previewUrl} alt="Reference Preview" className="h-48 object-contain rounded-lg" />
                   <label className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center text-xs font-medium text-amber-400 cursor-pointer rounded-lg transition-opacity">
                     Click to change photo
-                    <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+                    <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleFileChange} className="hidden" />
                   </label>
                 </div>
               ) : (
-                <label className="cursor-pointer block py-7">
+                <label className="cursor-pointer block py-8">
                   <div className="text-amber-500 text-3xl mb-1.5">📸</div>
-                  <span className="text-xs font-medium text-neutral-300 block">Upload a clear photo of your face</span>
-                  <p className="text-[11px] text-neutral-500 mt-1">PNG, JPG, or WEBP (well-lit front portrait works best)</p>
-                  <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" required />
+                  <span className="text-xs font-medium text-neutral-300 block">Upload your portrait or workspace photo</span>
+                  <p className="text-[11px] text-neutral-500 mt-1">JPEG, PNG, or WebP up to 10MB • Output dimensions match original</p>
+                  <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleFileChange} className="hidden" required />
                 </label>
               )}
             </div>
           </div>
 
-          {/* ─── STEP 2: Subject & Framing Calibration ─────────────────── */}
+          {/* ─── STEP 2: Scene Environment ─────────────────────────────── */}
           <div className="border-t border-neutral-800 pt-5">
             <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2 mb-3">
               <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">2</span>
-              <span>Subject & Framing Calibration</span>
-            </label>
-
-            {/* Subject Type Pills */}
-            <div className="mb-3">
-              <span className="text-[11px] text-neutral-400 block mb-1.5 font-medium">Subject Gender</span>
-              <div className="flex gap-2">
-                {SUBJECT_TYPES.map((t) => (
-                  <button
-                    key={t.id}
-                    type="button"
-                    onClick={() => setSubjectType(t.id)}
-                    className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold border transition-all ${
-                      subjectType === t.id
-                        ? 'border-amber-500 bg-amber-500/15 text-amber-300 shadow-sm'
-                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Hairstyle Pills */}
-            <div className="mb-3">
-              <span className="text-[11px] text-neutral-400 block mb-1.5 font-medium">Hairstyle / Headwear</span>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
-                {HAIRSTYLES.map((h) => (
-                  <button
-                    key={h.id}
-                    type="button"
-                    onClick={() => setHairStyle(h.id)}
-                    className={`py-1.5 px-2.5 rounded-lg text-[11px] font-medium border text-center truncate transition-all ${
-                      hairStyle === h.id
-                        ? 'border-amber-500 bg-amber-500/15 text-amber-300'
-                        : 'border-neutral-800 bg-neutral-950/60 text-neutral-400 hover:text-white'
-                    }`}
-                  >
-                    {h.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Framing & Aspect Ratio Dropdowns */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
-              <div>
-                <span className="text-[11px] text-neutral-400 block mb-1 font-medium">Camera Framing</span>
-                <select
-                  value={framing}
-                  onChange={(e) => setFraming(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-200 text-xs p-2.5 rounded-lg outline-none focus:border-amber-500"
-                >
-                  {FRAMING_OPTIONS.map((f) => (
-                    <option key={f.id} value={f.id}>{f.label}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <span className="text-[11px] text-neutral-400 block mb-1 font-medium">Aspect Ratio</span>
-                <select
-                  value={aspectRatio}
-                  onChange={(e) => setAspectRatio(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-200 text-xs p-2.5 rounded-lg outline-none focus:border-amber-500"
-                >
-                  {ASPECT_RATIOS.map((a) => (
-                    <option key={a.id} value={a.id}>{a.label}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          </div>
-
-          {/* ─── STEP 3: Scene Space Selector & Fine-Tuning ─────────────── */}
-          <div className="border-t border-neutral-800 pt-5">
-            <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2 mb-3">
-              <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">3</span>
               <span>Scene Environment</span>
             </label>
 
@@ -662,77 +669,24 @@ export default function App() {
                 );
               })}
             </div>
+          </div>
 
-            {/* Optional Custom Notes Input */}
-            <div className="mt-4">
-              <span className="text-[11px] text-neutral-400 block mb-1 font-medium">
-                Custom Styling Details (Optional)
-              </span>
-              <input
-                type="text"
-                value={customNotes}
-                onChange={(e) => setCustomNotes(e.target.value)}
-                placeholder="e.g. emerald velvet dinner jacket, holding a celebratory vintage glass"
-                className="w-full bg-neutral-950 border border-neutral-800 text-neutral-200 text-xs p-2.5 rounded-lg outline-none focus:border-amber-500"
-              />
-            </div>
-
-            {/* Collapsible Face Lock & Calibration Sliders */}
-            <div className="mt-3">
-              <button
-                type="button"
-                onClick={() => setShowFineTune(!showFineTune)}
-                className="text-xs text-amber-400/90 hover:text-amber-300 font-medium flex items-center gap-1"
-              >
-                <span>{showFineTune ? '▾ Hide' : '▸ Fine-Tune'} Face Lock & Lighting Blend</span>
-              </button>
-
-              {showFineTune && (
-                <div className="mt-3 p-3.5 rounded-xl bg-neutral-950 border border-neutral-800/80 space-y-3">
-                  <div>
-                    <div className="flex justify-between text-[11px] text-neutral-300 mb-1">
-                      <span>Face Identity Weight (`id_weight`)</span>
-                      <span className="font-mono text-amber-400">{idWeight.toFixed(2)}</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0.7"
-                      max="1.2"
-                      step="0.05"
-                      value={idWeight}
-                      onChange={(e) => setIdWeight(parseFloat(e.target.value))}
-                      className="w-full accent-amber-500"
-                    />
-                    <div className="flex justify-between text-[10px] text-neutral-500">
-                      <span>More Creative (0.7)</span>
-                      <span>Balanced (1.0)</span>
-                      <span>Strict Lock (1.2)</span>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between text-[11px] text-neutral-300 mb-1">
-                      <span>Lighting Blend Start Step (`start_step`)</span>
-                      <span className="font-mono text-amber-400">{startStep}</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max="4"
-                      step="1"
-                      value={startStep}
-                      onChange={(e) => setStartStep(parseInt(e.target.value, 10))}
-                      className="w-full accent-amber-500"
-                    />
-                    <div className="flex justify-between text-[10px] text-neutral-500">
-                      <span>Immediate Face Inject (0)</span>
-                      <span>Natural Ambient Blend (1)</span>
-                      <span>Deep Diffusion (4)</span>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
+          {/* ─── STEP 3: Outfit & Wardrobe Change (Optional) ──────────── */}
+          <div className="border-t border-neutral-800 pt-5">
+            <label className="text-xs font-bold uppercase tracking-wider text-neutral-300 flex items-center gap-2 mb-1.5">
+              <span className="w-5 h-5 rounded-full bg-amber-500 text-neutral-950 flex items-center justify-center text-[11px] font-black">3</span>
+              <span>Outfit & Wardrobe Change (Optional)</span>
+            </label>
+            <p className="text-[11px] text-neutral-500 mb-2">
+              Leave blank to keep your exact original outfit, desk, laptop, and surrounding items intact.
+            </p>
+            <input
+              type="text"
+              value={customNotes}
+              onChange={(e) => setCustomNotes(e.target.value)}
+              placeholder="e.g. emerald velvet dinner jacket, crisp white collar shirt"
+              className="w-full bg-neutral-950 border border-neutral-800 text-neutral-200 text-xs p-3 rounded-xl outline-none focus:border-amber-500"
+            />
           </div>
 
           {/* Error Notice */}
@@ -752,7 +706,7 @@ export default function App() {
             {loading ? (
               <>
                 <div className="w-4 h-4 border-2 border-neutral-950 border-t-transparent rounded-full animate-spin"></div>
-                <span>Synthesizing Optical Realism (28 Steps)...</span>
+                <span>{loadingStage}</span>
               </>
             ) : (
               <span>Shoot Photoshoot ({selectedScene.title})</span>
@@ -766,22 +720,31 @@ export default function App() {
           <div className="bg-neutral-900/90 border border-neutral-800 rounded-2xl p-5 shadow-2xl flex flex-col items-center justify-center min-h-[460px]">
             {activeResult ? (
               <div className="w-full flex flex-col items-center">
-                <div className="flex items-center justify-between w-full mb-3">
+                <div className="flex items-center justify-between w-full mb-3 flex-wrap gap-2">
                   <div className="flex flex-col">
                     <span className="text-xs font-bold text-amber-400 uppercase tracking-wider">{activeResult.sceneTitle || 'AI Photoshoot'}</span>
-                    {activeResult.seed && (
-                      <span className="text-[10px] font-mono text-neutral-500">Seed: {activeResult.seed}</span>
-                    )}
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className="text-[10px] text-neutral-500">
+                        {new Date(activeResult.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                      {activeResult.width && activeResult.height && (
+                        <span className="text-[10px] font-mono text-neutral-500">
+                          {activeResult.width}×{activeResult.height}px
+                        </span>
+                      )}
+                      <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700/60">
+                        AI-generated image
+                      </span>
+                    </div>
                   </div>
-                  <a
-                    href={activeResult.imageUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    download="yanga-photoshoot.jpg"
-                    className="text-xs text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5 rounded-lg border border-neutral-700 transition-colors"
+                  <button
+                    type="button"
+                    onClick={() => handleDownload(activeResult.imageUrl, activeResult.sceneTitle)}
+                    className="text-xs text-neutral-200 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-3 py-1.5 rounded-lg border border-neutral-700 transition-colors flex items-center gap-1.5"
                   >
-                    Save HD Photo ⬇️
-                  </a>
+                    <span>Save HD Photo</span>
+                    <span>⬇️</span>
+                  </button>
                 </div>
                 <img
                   src={activeResult.imageUrl}
@@ -792,40 +755,72 @@ export default function App() {
             ) : loading ? (
               <div className="flex flex-col items-center justify-center text-center py-16">
                 <div className="w-16 h-16 rounded-full border-4 border-amber-500/20 border-t-amber-500 animate-spin mb-4"></div>
-                <h3 className="text-base font-bold text-white mb-1">Synthesizing Optical Realism</h3>
-                <p className="text-xs text-neutral-400 max-w-xs">
-                  FLUX + PuLID is applying 85mm f/1.4 lens physics, natural skin subsurface scattering, and scene lighting.
+                <h3 className="text-base font-bold text-white mb-1">Synthesizing Photoshoot</h3>
+                <p className="text-xs text-neutral-400 max-w-xs mb-2">
+                  {loadingStage}
                 </p>
+                <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-widest">
+                  Nano Banana + SeedVR2 Pipeline
+                </span>
               </div>
             ) : (
               <div className="flex flex-col items-center justify-center text-center text-neutral-500 py-16">
                 <div className="text-5xl mb-3 opacity-30">✨</div>
                 <h3 className="text-sm font-semibold text-neutral-400 mb-1">Studio Viewport Empty</h3>
                 <p className="text-xs text-neutral-600 max-w-xs">
-                  Upload your selfie and click "Shoot Photoshoot" to see the transformed editorial portrait here.
+                  Upload your photo and click "Shoot Photoshoot" to see your photorealistic editorial portrait here.
                 </p>
               </div>
             )}
           </div>
 
           {/* Session Output Stream (Recent Generative Array) */}
-          {results.length > 1 && (
+          {results.length > 0 && (
             <div className="bg-neutral-900/60 border border-neutral-800/80 rounded-2xl p-4">
-              <span className="text-[11px] font-bold text-neutral-400 uppercase tracking-wider block mb-2">
-                This Session's Takes ({results.length})
-              </span>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-[11px] font-bold text-neutral-400 uppercase tracking-wider block">
+                  This Session's Takes ({results.length})
+                </span>
+                <span className="text-[9px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700/60">
+                  AI-generated image
+                </span>
+              </div>
+
+              <div className="flex flex-col gap-3">
                 {results.map((r, idx) => (
                   <div
                     key={r.id || idx}
                     onClick={() => setActiveResult(r)}
-                    className={`cursor-pointer rounded-lg overflow-hidden border transition-all ${
+                    className={`cursor-pointer rounded-xl p-2.5 border transition-all flex items-center justify-between gap-3 ${
                       activeResult?.imageUrl === r.imageUrl
-                        ? 'border-amber-500 ring-2 ring-amber-500/30'
-                        : 'border-neutral-800 hover:border-neutral-700'
+                        ? 'border-amber-500 bg-amber-500/10 ring-1 ring-amber-500/30'
+                        : 'border-neutral-800 bg-neutral-950/60 hover:border-neutral-700'
                     }`}
                   >
-                    <img src={r.imageUrl} alt={r.sceneTitle} className="w-full h-20 object-cover" />
+                    <div className="flex items-center gap-3 min-w-0">
+                      <img src={r.imageUrl} alt={r.sceneTitle} className="w-16 h-16 object-cover rounded-lg flex-shrink-0 border border-neutral-800" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-neutral-200 truncate">{r.sceneTitle}</div>
+                        <div className="text-[10px] text-neutral-500 mt-0.5">
+                          {new Date(r.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          {r.width && r.height ? ` • ${r.width}×${r.height}` : ''}
+                        </div>
+                        <div className="text-[9px] text-neutral-400 mt-1 inline-block">
+                          AI-generated image
+                        </div>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDownload(r.imageUrl, r.sceneTitle);
+                      }}
+                      className="text-[11px] text-neutral-300 hover:text-white bg-neutral-800 hover:bg-neutral-700 px-2.5 py-1 rounded-md border border-neutral-700 flex-shrink-0 transition-colors"
+                    >
+                      Save HD ⬇️
+                    </button>
                   </div>
                 ))}
               </div>
@@ -873,7 +868,10 @@ export default function App() {
                   <p className="text-[11px] text-white font-medium line-clamp-2">
                     {item.sceneTitle || item.prompt || 'AI Photoshoot'}
                   </p>
-                  <span className="text-[10px] text-amber-400 mt-1">Click to view in Studio</span>
+                  <div className="flex items-center justify-between mt-1">
+                    <span className="text-[9px] text-neutral-400">AI-generated image</span>
+                    <span className="text-[10px] text-amber-400 font-semibold">View</span>
+                  </div>
                 </div>
               </div>
             ))}
