@@ -39,6 +39,11 @@ const DEFAULT_LOCKS = {
   background: false
 };
 
+export function getPhotoId(item) {
+  if (!item) return '';
+  return item.jobId || item.id || item.publicId || item.imageUrl || '';
+}
+
 function getLineageText(item) {
   if (!item) return 'Version 1 (Initial)';
   const version = item.version || 1;
@@ -207,8 +212,8 @@ export default function App() {
       if (data.success && Array.isArray(data.history)) {
         setHistory((prev) => {
           const map = new Map();
-          data.history.forEach((item) => map.set(item.jobId || item.id || item.imageUrl, item));
-          prev.forEach((item) => map.set(item.jobId || item.id || item.imageUrl, item));
+          data.history.forEach((item) => map.set(getPhotoId(item), item));
+          prev.forEach((item) => map.set(getPhotoId(item), item));
           const combined = Array.from(map.values()).sort(
             (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
           );
@@ -451,7 +456,13 @@ export default function App() {
       document.body.removeChild(link);
       URL.revokeObjectURL(blobUrl);
     } catch {
-      window.open(imageUrl, '_blank');
+      const safeName = (title || 'yanga-photoshoot').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      if (imageUrl && imageUrl.includes('res.cloudinary.com') && imageUrl.includes('/image/upload/')) {
+        const dlUrl = imageUrl.replace('/image/upload/', `/image/upload/fl_attachment:${safeName}/`);
+        window.open(dlUrl, '_blank');
+      } else {
+        window.open(imageUrl, '_blank');
+      }
     }
   };
 
@@ -686,36 +697,38 @@ export default function App() {
 
   // ─── Delete Actions ───────────────────────────────────────────────────────
   const handleDeleteSinglePhoto = async (item) => {
+    const itemId = getPhotoId(item);
     const jobId = item.jobId || item.id;
     if (!confirm('Are you sure you want to delete this photoshoot from the server?')) {
       return;
     }
 
     try {
-      const res = await fetch(`/api/generate/${jobId}`, {
-        method: 'DELETE',
-        credentials: 'include'
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        alert(data.error || 'Failed to delete photo.');
-        return;
+      if (jobId) {
+        const res = await fetch(`/api/generate/${jobId}`, {
+          method: 'DELETE',
+          credentials: 'include'
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.success) {
+          console.warn('Backend delete error (continuing local removal):', data.error);
+        }
       }
 
-      setResults((prev) => prev.filter((x) => (x.jobId || x.id) !== jobId));
+      setResults((prev) => prev.filter((x) => getPhotoId(x) !== itemId));
       setHistory((prev) => {
-        const next = prev.filter((x) => (x.jobId || x.id) !== jobId && x.imageUrl !== item.imageUrl);
+        const next = prev.filter((x) => getPhotoId(x) !== itemId && x.imageUrl !== item.imageUrl);
         localStorage.setItem('yanga_history', JSON.stringify(next));
         return next;
       });
 
-      if ((activeResult?.jobId || activeResult?.id) === jobId || activeResult?.imageUrl === item.imageUrl) {
+      if (getPhotoId(activeResult) === itemId || activeResult?.imageUrl === item.imageUrl) {
         setActiveResult(null);
       }
 
       setSelectedIds((prev) => {
         const next = new Set(prev);
-        next.delete(jobId);
+        next.delete(itemId);
         return next;
       });
 
@@ -756,10 +769,13 @@ export default function App() {
 
   // ─── Multi-Select & Batch Zip Download ────────────────────────────────────
   const allPhotosMap = new Map();
-  results.forEach((r) => allPhotosMap.set(r.jobId || r.id, r));
+  results.forEach((r) => {
+    const id = getPhotoId(r);
+    if (id) allPhotosMap.set(id, r);
+  });
   history.forEach((h) => {
-    const id = h.jobId || h.id;
-    if (!allPhotosMap.has(id)) {
+    const id = getPhotoId(h);
+    if (id && !allPhotosMap.has(id)) {
       allPhotosMap.set(id, h);
     }
   });
@@ -768,7 +784,7 @@ export default function App() {
   const handleSelectAll = () => {
     const next = new Set();
     allPhotos.forEach((item) => {
-      const id = item.jobId || item.id;
+      const id = getPhotoId(item);
       if (id) next.add(id);
     });
     setSelectedIds(next);
@@ -793,6 +809,28 @@ export default function App() {
       return;
     }
 
+    const itemsToDownload = isAll
+      ? allPhotos.map((p) => ({
+          id: getPhotoId(p),
+          jobId: p.jobId || p.id,
+          publicId: p.publicId,
+          imageUrl: p.imageUrl,
+          originalUrl: p.originalUrl,
+          sceneTitle: p.sceneTitle || p.instruction || p.prompt,
+          filename: p.filename || p.localFileName
+        }))
+      : allPhotos
+          .filter((p) => selectedIds.has(getPhotoId(p)))
+          .map((p) => ({
+            id: getPhotoId(p),
+            jobId: p.jobId || p.id,
+            publicId: p.publicId,
+            imageUrl: p.imageUrl,
+            originalUrl: p.originalUrl,
+            sceneTitle: p.sceneTitle || p.instruction || p.prompt,
+            filename: p.filename || p.localFileName
+          }));
+
     setDownloadingZip(true);
     try {
       const res = await fetch('/api/generate/download-zip', {
@@ -801,6 +839,7 @@ export default function App() {
         body: JSON.stringify({
           all: isAll,
           jobIds: idsToDownload,
+          items: itemsToDownload,
           includeOriginals: includeOriginalsZip
         }),
         credentials: 'include'
@@ -1895,7 +1934,7 @@ export default function App() {
 
               <div className="flex flex-col gap-3">
                 {results.map((r) => {
-                  const rId = r.jobId || r.id;
+                  const rId = getPhotoId(r);
                   const isViewingOrig = cardViewMap[rId] === 'original';
                   const displayImg = isViewingOrig ? (r.originalUrl || previewUrl || r.imageUrl) : r.imageUrl;
 
@@ -2084,7 +2123,7 @@ export default function App() {
         {allPhotos.length > 0 ? (
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
             {allPhotos.map((item) => {
-              const itemId = item.jobId || item.id;
+              const itemId = getPhotoId(item);
               const isSelected = selectedIds.has(itemId);
               const isViewingOrig = cardViewMap[itemId] === 'original';
               const displayImg = isViewingOrig ? (item.originalUrl || previewUrl || item.imageUrl) : item.imageUrl;

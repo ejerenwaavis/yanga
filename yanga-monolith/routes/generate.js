@@ -6,9 +6,28 @@ import fs from 'fs';
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import { fal } from '@fal-ai/client';
+import * as archiverModule from 'archiver';
 
 const require = createRequire(import.meta.url);
-const archiver = require('archiver');
+
+function createZipArchive(options = { zlib: { level: 6 } }) {
+  if (typeof archiverModule.ZipArchive === 'function') {
+    return new archiverModule.ZipArchive(options);
+  }
+  if (typeof archiverModule.default === 'function') {
+    return archiverModule.default('zip', options);
+  }
+  if (typeof archiverModule === 'function') {
+    return archiverModule('zip', options);
+  }
+  try {
+    const cjsArchiver = require('archiver');
+    if (typeof cjsArchiver === 'function') return cjsArchiver('zip', options);
+    if (cjsArchiver && cjsArchiver.ZipArchive) return new cjsArchiver.ZipArchive(options);
+    if (cjsArchiver && typeof cjsArchiver.default === 'function') return cjsArchiver.default('zip', options);
+  } catch {}
+  throw new Error('Archiver initialization failed: no supported constructor found.');
+}
 import { 
   uploadReferenceImage, 
   uploadGeneratedImage, 
@@ -688,9 +707,9 @@ router.post('/download-zip', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Authentication required.' });
     }
 
-    const { jobIds, includeOriginals, all } = req.body;
+    const { jobIds, items, includeOriginals, all } = req.body;
 
-    // Collect user-scoped jobs
+    // Collect user-scoped jobs from memory
     const userJobMap = new Map();
     for (const [id, job] of jobsStore.entries()) {
       if (job.userId === userId && job.status === 'done') {
@@ -698,29 +717,145 @@ router.post('/download-zip', async (req, res) => {
       }
     }
 
-    // Also scan GENERATIONS_DIR for JSONs
+    // Also scan GENERATIONS_DIR for user JSONs
     try {
-      const files = fs.readdirSync(GENERATIONS_DIR);
-      for (const file of files) {
-        if (file.endsWith('.json')) {
-          const data = JSON.parse(fs.readFileSync(path.join(GENERATIONS_DIR, file), 'utf8'));
-          if (data.userId === userId && data.status === 'done' && !userJobMap.has(data.jobId)) {
-            userJobMap.set(data.jobId, data);
+      if (fs.existsSync(GENERATIONS_DIR)) {
+        const files = fs.readdirSync(GENERATIONS_DIR);
+        for (const file of files) {
+          if (file.endsWith('.json')) {
+            try {
+              const data = JSON.parse(fs.readFileSync(path.join(GENERATIONS_DIR, file), 'utf8'));
+              if (data.userId === userId && data.status === 'done' && !userJobMap.has(data.jobId)) {
+                userJobMap.set(data.jobId, data);
+              }
+            } catch {}
           }
         }
       }
-    } catch {}
-
-    let targetJobs = [];
-    if (all) {
-      targetJobs = Array.from(userJobMap.values());
-    } else if (Array.isArray(jobIds) && jobIds.length > 0) {
-      targetJobs = jobIds
-        .map(id => userJobMap.get(id))
-        .filter(Boolean);
+    } catch (e) {
+      console.warn('[ZIP] Error scanning GENERATIONS_DIR:', e.message);
     }
 
-    if (targetJobs.length === 0) {
+    // Build candidate list of all user photos (local + Cloudinary + client payload)
+    const candidateMap = new Map();
+
+    // 1. Local / memory jobs
+    for (const job of userJobMap.values()) {
+      const key = job.jobId || job.result?.imageUrl || job.imageUrl;
+      if (key) {
+        candidateMap.set(key, {
+          jobId: job.jobId,
+          imageUrl: job.result?.imageUrl || job.imageUrl,
+          originalUrl: job.originalUrl || job.result?.originalUrl,
+          localFileName: job.localFileName || job.filename || `${job.jobId}.jpg`,
+          originalFileName: job.originalFileName || `${job.jobId}-orig.jpg`,
+          title: job.sceneTitle || job.instruction || job.prompt || 'photo'
+        });
+      }
+    }
+
+    // 2. Cloudinary vault photos for this user
+    try {
+      const cloudHistory = await getUserGenerations(userId);
+      for (const ch of cloudHistory) {
+        const key = ch.publicId || ch.imageUrl;
+        let alreadyPresent = false;
+        for (const existing of candidateMap.values()) {
+          if (existing.imageUrl === ch.imageUrl) {
+            alreadyPresent = true;
+            break;
+          }
+        }
+        if (!alreadyPresent && key) {
+          candidateMap.set(key, {
+            publicId: ch.publicId,
+            imageUrl: ch.imageUrl,
+            originalUrl: null,
+            title: ch.prompt || 'photo'
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('[ZIP] Cloudinary vault query skipped:', err.message);
+    }
+
+    // 3. Incorporate any client-supplied items array
+    if (Array.isArray(items) && items.length > 0) {
+      for (const it of items) {
+        const key = it.id || it.jobId || it.publicId || it.imageUrl;
+        if (!key) continue;
+        let matched = candidateMap.get(key);
+        if (!matched) {
+          for (const cand of candidateMap.values()) {
+            if (cand.imageUrl === it.imageUrl || (it.jobId && cand.jobId === it.jobId)) {
+              matched = cand;
+              break;
+            }
+          }
+        }
+        if (matched) {
+          if (!matched.originalUrl && it.originalUrl) matched.originalUrl = it.originalUrl;
+          if (!matched.title && (it.sceneTitle || it.title)) matched.title = it.sceneTitle || it.title;
+        } else {
+          candidateMap.set(key, {
+            id: it.id,
+            jobId: it.jobId,
+            publicId: it.publicId,
+            imageUrl: it.imageUrl,
+            originalUrl: it.originalUrl,
+            localFileName: it.filename || it.localFileName,
+            title: it.sceneTitle || it.title || it.instruction || 'photo'
+          });
+        }
+      }
+    }
+
+    // Determine target photos
+    let targetPhotos = [];
+    if (all) {
+      targetPhotos = Array.from(candidateMap.values());
+    } else {
+      const selectedKeys = new Set(Array.isArray(jobIds) ? jobIds : []);
+      if (Array.isArray(items)) {
+        for (const it of items) {
+          if (it.id) selectedKeys.add(it.id);
+          if (it.jobId) selectedKeys.add(it.jobId);
+          if (it.publicId) selectedKeys.add(it.publicId);
+          if (it.imageUrl) selectedKeys.add(it.imageUrl);
+        }
+      }
+
+      for (const [key, photo] of candidateMap.entries()) {
+        if (
+          selectedKeys.has(key) ||
+          (photo.jobId && selectedKeys.has(photo.jobId)) ||
+          (photo.publicId && selectedKeys.has(photo.publicId)) ||
+          (photo.id && selectedKeys.has(photo.id)) ||
+          (photo.imageUrl && selectedKeys.has(photo.imageUrl))
+        ) {
+          targetPhotos.push(photo);
+        }
+      }
+
+      // If any item from client `items` wasn't matched yet, include directly
+      if (Array.isArray(items)) {
+        for (const it of items) {
+          if (it.imageUrl && !targetPhotos.some((p) => p.imageUrl === it.imageUrl)) {
+            targetPhotos.push({
+              id: it.id,
+              jobId: it.jobId,
+              publicId: it.publicId,
+              imageUrl: it.imageUrl,
+              originalUrl: it.originalUrl,
+              localFileName: it.filename || it.localFileName,
+              title: it.sceneTitle || it.title || it.instruction || 'photo'
+            });
+          }
+        }
+      }
+    }
+
+    if (targetPhotos.length === 0) {
       return res.status(404).json({ success: false, error: 'No photos found to download.' });
     }
 
@@ -731,7 +866,7 @@ router.post('/download-zip', async (req, res) => {
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
 
-    const archive = archiver('zip', { zlib: { level: 6 } });
+    const archive = createZipArchive({ zlib: { level: 6 } });
     archive.on('error', (err) => {
       console.error('[ZIP ARCHIVER ERROR]', err);
       if (!res.headersSent) res.status(500).send('Failed to build zip archive.');
@@ -741,42 +876,111 @@ router.post('/download-zip', async (req, res) => {
 
     const addedEntries = new Set();
 
-    for (const job of targetJobs) {
-      const resultFileName = job.filename || job.localFileName || `${job.jobId}.jpg`;
-      const localResultPath = path.join(GENERATIONS_DIR, job.localFileName || resultFileName);
+    for (let idx = 0; idx < targetPhotos.length; idx++) {
+      const photo = targetPhotos[idx];
 
-      if (fs.existsSync(localResultPath) && !addedEntries.has(resultFileName)) {
+      // Determine clean, human-readable file name
+      let baseName = '';
+      if (photo.localFileName && !photo.localFileName.startsWith('job_')) {
+        baseName = path.basename(photo.localFileName).replace(/\.[^.]+$/, '');
+      } else {
+        const slug = (photo.title || 'photo')
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 40) || 'photo';
+        baseName = `${slug}-${String(idx + 1).padStart(2, '0')}`;
+      }
+
+      let resultFileName = `${baseName}.jpg`;
+      let counter = 1;
+      while (addedEntries.has(resultFileName)) {
+        resultFileName = `${baseName}-${counter}.jpg`;
+        counter++;
+      }
+
+      // Check local HD file on disk first
+      let localResultPath = null;
+      if (photo.localFileName) {
+        const p = path.join(GENERATIONS_DIR, photo.localFileName);
+        if (fs.existsSync(p)) localResultPath = p;
+      }
+      if (!localResultPath && photo.jobId) {
+        const p = path.join(GENERATIONS_DIR, `${photo.jobId}.jpg`);
+        if (fs.existsSync(p)) localResultPath = p;
+      }
+
+      if (localResultPath) {
         archive.file(localResultPath, { name: resultFileName });
         addedEntries.add(resultFileName);
-      } else if (job.result?.imageUrl || job.imageUrl) {
+      } else if (photo.imageUrl) {
+        // Fetch full HD image directly from Cloudinary / Fal
         try {
-          const fetchRes = await fetch(job.result?.imageUrl || job.imageUrl);
+          // If relative path on local server
+          if (photo.imageUrl.startsWith('/api/generate/image/')) {
+            const relName = path.basename(photo.imageUrl);
+            const relPath = path.join(GENERATIONS_DIR, relName);
+            if (fs.existsSync(relPath)) {
+              archive.file(relPath, { name: resultFileName });
+              addedEntries.add(resultFileName);
+              continue;
+            }
+          }
+
+          const fetchRes = await fetch(photo.imageUrl, {
+            headers: { Accept: 'image/*' }
+          });
           if (fetchRes.ok) {
             const buf = Buffer.from(await fetchRes.arrayBuffer());
             archive.append(buf, { name: resultFileName });
             addedEntries.add(resultFileName);
           }
-        } catch {}
+        } catch (fetchErr) {
+          console.warn('[ZIP FETCH FAILED]', photo.imageUrl, fetchErr.message);
+        }
       }
 
       // If user selected "Include originals"
       if (includeOriginals) {
-        const origFileName = job.originalFileName || `${job.jobId}-orig.jpg`;
-        const localOrigPath = path.join(ORIGINALS_DIR, origFileName);
-        const inZipOrigName = `originals/${resultFileName.replace(/\.jpg$/i, '')}-original.jpg`;
+        const origBaseName = `originals/${resultFileName.replace(/\.jpg$/i, '')}-original.jpg`;
+        if (!addedEntries.has(origBaseName)) {
+          let localOrigPath = null;
+          if (photo.originalFileName) {
+            const p = path.join(ORIGINALS_DIR, photo.originalFileName);
+            if (fs.existsSync(p)) localOrigPath = p;
+          }
+          if (!localOrigPath && photo.jobId) {
+            const p = path.join(ORIGINALS_DIR, `${photo.jobId}-orig.jpg`);
+            if (fs.existsSync(p)) localOrigPath = p;
+          }
 
-        if (fs.existsSync(localOrigPath) && !addedEntries.has(inZipOrigName)) {
-          archive.file(localOrigPath, { name: inZipOrigName });
-          addedEntries.add(inZipOrigName);
-        } else if (job.originalUrl || job.result?.originalUrl) {
-          try {
-            const fetchRes = await fetch(job.originalUrl || job.result?.originalUrl);
-            if (fetchRes.ok) {
-              const buf = Buffer.from(await fetchRes.arrayBuffer());
-              archive.append(buf, { name: inZipOrigName });
-              addedEntries.add(inZipOrigName);
+          if (localOrigPath) {
+            archive.file(localOrigPath, { name: origBaseName });
+            addedEntries.add(origBaseName);
+          } else if (photo.originalUrl) {
+            try {
+              if (photo.originalUrl.startsWith('/api/generate/original/')) {
+                const relName = path.basename(photo.originalUrl);
+                const relPath = path.join(ORIGINALS_DIR, relName);
+                if (fs.existsSync(relPath)) {
+                  archive.file(relPath, { name: origBaseName });
+                  addedEntries.add(origBaseName);
+                  continue;
+                }
+              }
+
+              const fetchRes = await fetch(photo.originalUrl, {
+                headers: { Accept: 'image/*' }
+              });
+              if (fetchRes.ok) {
+                const buf = Buffer.from(await fetchRes.arrayBuffer());
+                archive.append(buf, { name: origBaseName });
+                addedEntries.add(origBaseName);
+              }
+            } catch (origErr) {
+              console.warn('[ZIP ORIG FETCH FAILED]', photo.originalUrl, origErr.message);
             }
-          } catch {}
+          }
         }
       }
     }
