@@ -438,7 +438,10 @@ async function runPipelineV2Worker(jobId, jobParams) {
 router.post('/', upload.single('image'), async (req, res) => {
   try {
     const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '127.0.0.1';
-    const userId = req.user?.userId || req.body?.userId;
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
 
     // REQUIREMENT 1: Accept instruction (single source of truth)
     const instruction = (req.body.instruction || req.body.prompt || '').trim();
@@ -1137,9 +1140,9 @@ router.get('/:jobId', handleJobStatus);
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/history', async (req, res) => {
   try {
-    const userId = req.user?.userId || req.query.userId;
+    const userId = req.user?.userId;
     if (!userId) {
-      return res.json({ success: true, history: [] });
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
     }
     const history = await getUserGenerations(userId);
     res.json({ success: true, history });
